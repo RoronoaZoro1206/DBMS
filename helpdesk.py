@@ -76,6 +76,16 @@ def get_db_connection():
         print("Error: Unable to connect to the database.", e)
         return None
 
+def set_trigger_user(cur, user_id):
+    """Set the session variable consumed by audit triggers."""
+    if user_id is None:
+        return
+    try:
+        value = int(user_id)
+    except (TypeError, ValueError):
+        return
+    cur.execute('SET session "app.user_id" = %s;', (str(value),))
+
 def find_tickets(query_string, show_resolved=False):
     conn = get_db_connection()
     if not conn:
@@ -117,9 +127,7 @@ def mark_ticket_as_resolved(ticket_id, admin_username, user_id=None):
         cur = conn.cursor()
         
         # PHASE 3: Set session variable for auditing trigger
-        if user_id:
-            # Use simple SET command without parameters that cause issues
-            cur.execute(f"SET app.user_id = {int(user_id)}")
+        set_trigger_user(cur, user_id)
         
         cur.execute("CALL mark_ticket_resolved(%s, %s)", (ticket_id, admin_username))
 
@@ -284,33 +292,61 @@ html_template = """
           </a>
         </div>
         
-        {% if search_message %}
-          <p class="text-red-500 text-sm mt-2">{{ search_message }}</p>
-        {% endif %}
-        {% if resolve_message %}
-          <p class="text-green-600 text-sm mt-2">{{ resolve_message }}</p>
-        {% endif %}
+                {% if search_message %}
+                    <p class="text-red-500 text-sm mt-2">{{ search_message }}</p>
+                {% endif %}
+                {% if resolve_message %}
+                    <p class="text-green-600 text-sm mt-2">{{ resolve_message }}</p>
+                {% endif %}
+                {% if manage_message %}
+                    <p class="text-sm mt-2 {% if manage_error %}text-red-500{% else %}text-blue-600{% endif %}">{{ manage_message }}</p>
+                {% endif %}
         <div class="mt-6">
           {% if results is not none %}
             <h3 class="text-lg font-semibold mb-2">{% if show_resolved %}Resolved Tickets{% else %}Active Tickets{% endif %}</h3>
             {% if results %}
               <ul class="space-y-2">
                 {% for ticket in results %}
-                  <li class="p-3 bg-gray-50 rounded-lg border text-sm flex justify-between items-center">
-                    <div class="flex-1">
-                      <span class="font-medium text-gray-900">Ticket #{{ ticket[0] }}</span>: {{ ticket[1] }}
-                    </div>
-                    {% if not show_resolved %}
-                    <form action="/resolve_ticket" method="post" class="inline ml-3">
-                      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-                      <input type="hidden" name="ticket_id" value="{{ ticket[0] }}">
-                      <button type="submit"
-                        class="bg-green-500 text-white text-xs font-medium py-1 px-3 rounded hover:bg-green-600 transition">
-                        Resolve
-                      </button>
-                    </form>
-                    {% endif %}
-                  </li>
+                                    <li class="p-3 bg-gray-50 rounded-lg border text-sm">
+                                        <div class="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
+                                            <div class="flex-1">
+                                                <span class="font-medium text-gray-900">Ticket #{{ ticket[0] }}</span>: {{ ticket[1] }}
+                                            </div>
+                                            <div class="flex flex-wrap items-center gap-2">
+                                                {% if not show_resolved %}
+                                                <form action="/resolve_ticket" method="post" class="inline">
+                                                    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                                                    <input type="hidden" name="ticket_id" value="{{ ticket[0] }}">
+                                                    <button type="submit"
+                                                        class="bg-green-500 text-white text-xs font-medium py-1 px-3 rounded hover:bg-green-600 transition">
+                                                        Resolve
+                                                    </button>
+                                                </form>
+                                                {% endif %}
+                                                {% if session.get('role') == 'admin_role' %}
+                                                <form action="/tickets/edit" method="post" class="flex items-center gap-2" autocomplete="off">
+                                                    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                                                    <input type="hidden" name="ticket_id" value="{{ ticket[0] }}">
+                                                    <input type="hidden" name="source" value="{% if show_resolved %}resolved{% else %}active{% endif %}">
+                                                    <input type="text" name="issue" value="{{ ticket[1]|e }}" class="border border-gray-300 rounded px-2 py-1 text-xs md:w-60" autocomplete="off">
+                                                    <button type="submit"
+                                                        class="bg-blue-500 text-white text-xs font-medium py-1 px-3 rounded hover:bg-blue-600 transition">
+                                                        Update
+                                                    </button>
+                                                </form>
+                                                <form action="/tickets/delete" method="post" class="inline" onsubmit="return confirm('Delete this ticket?');">
+                                                    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                                                    <input type="hidden" name="ticket_id" value="{{ ticket[0] }}">
+                                                    <input type="hidden" name="source" value="{% if show_resolved %}resolved{% else %}active{% endif %}">
+                                                    <button type="submit"
+                                                        class="bg-red-500 text-white text-xs font-medium py-1 px-3 rounded hover:bg-red-600 transition">
+                                                        Delete
+                                                    </button>
+                                                </form>
+                                                {% endif %}
+                                            </div>
+                                        </div>
+                                    </li>
                 {% endfor %}
               </ul>
             {% else %}
@@ -506,8 +542,7 @@ def add_student():
         cur = conn.cursor()
 
         user_id = session.get('user_id')
-        if user_id:
-            cur.execute(f"SET app.user_id = {int(user_id)}")
+        set_trigger_user(cur, user_id)
 
         cur.execute("SELECT id FROM students WHERE LOWER(email) = LOWER(%s)", (email,))
         existing = cur.fetchone()
@@ -578,9 +613,7 @@ def submit_ticket():
         
         # PHASE 3: Set session variable for auditing trigger
         user_id = session.get('user_id')
-        if user_id:
-            # Use simple SET command without parameters that cause issues
-            cur.execute(f"SET app.user_id = {int(user_id)}")
+        set_trigger_user(cur, user_id)
         
         # PHASE 3: To identify who made the change.
         cur.execute("INSERT INTO tickets (student_id, issue) VALUES (%s, %s) RETURNING id", (student_id, issue))
@@ -692,6 +725,238 @@ def resolve_ticket():
             results=None,
             search_message=message
         )
+
+@app.route('/tickets/edit', methods=['POST'])
+@login_required
+def edit_ticket():
+    if session.get('role') != 'admin_role':
+        return render_template_string(
+            html_template,
+            results=None,
+            manage_message="Access denied: admin only.",
+            manage_error=True
+        )
+
+    source = request.form.get('source', 'active')
+    show_resolved = source == 'resolved'
+    ticket_id_raw = request.form.get('ticket_id')
+    updated_issue = request.form.get('issue', '').strip()
+
+    try:
+        ticket_id = int(ticket_id_raw)
+    except (TypeError, ValueError):
+        results = find_tickets('', show_resolved)
+        return render_template_string(
+            html_template,
+            results=results,
+            show_resolved=show_resolved,
+            manage_message="Invalid ticket ID.",
+            manage_error=True
+        )
+
+    if not updated_issue:
+        results = find_tickets('', show_resolved)
+        return render_template_string(
+            html_template,
+            results=results,
+            show_resolved=show_resolved,
+            manage_message="Issue description is required.",
+            manage_error=True
+        )
+
+    if len(updated_issue) > 1000:
+        results = find_tickets('', show_resolved)
+        return render_template_string(
+            html_template,
+            results=results,
+            show_resolved=show_resolved,
+            manage_message="Issue description is too long (max 1000 characters).",
+            manage_error=True
+        )
+
+    conn = get_db_connection()
+    if not conn:
+        return render_template_string(
+            html_template,
+            results=None,
+            show_resolved=show_resolved,
+            manage_message="Service temporarily unavailable.",
+            manage_error=True
+        )
+
+    cur = None
+    manage_message = "Ticket updated successfully."
+    manage_error = False
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT student_id, issue FROM tickets WHERE id = %s", (ticket_id,))
+        row = cur.fetchone()
+        if not row:
+            manage_message = "Ticket not found."
+            manage_error = True
+        else:
+            student_id, old_issue = row
+            set_trigger_user(cur, session.get('user_id'))
+            cur.execute("UPDATE tickets SET issue = %s WHERE id = %s", (updated_issue, ticket_id))
+
+            staff_id = session.get('user_id')
+            staff_value = int(staff_id) if staff_id is not None else None
+            old_data = {
+                "ticket_id": ticket_id,
+                "student_id": student_id,
+                "issue": old_issue
+            }
+            new_data = {
+                "ticket_id": ticket_id,
+                "student_id": student_id,
+                "issue": updated_issue
+            }
+            cur.execute(
+                """
+                UPDATE audit_log_ticket
+                   SET action = %s,
+                       staff_id = COALESCE(%s, staff_id),
+                       old_data = %s,
+                       new_data = %s
+                 WHERE audit_id = (
+                        SELECT audit_id FROM audit_log_ticket
+                         WHERE ticket_id = %s AND action = 'UPDATE'
+                         ORDER BY logged_at DESC
+                         LIMIT 1
+                    )
+                """,
+                ('TICKET_EDIT', staff_value, Json(old_data), Json(new_data), ticket_id)
+            )
+            if cur.rowcount == 0:
+                cur.execute(
+                    "INSERT INTO audit_log_ticket (ticket_id, staff_id, action, old_data, new_data) VALUES (%s, %s, %s, %s, %s)",
+                    (ticket_id, staff_value, 'TICKET_EDIT', Json(old_data), Json(new_data))
+                )
+
+            conn.commit()
+    except (Exception, psycopg2.Error) as error:
+        print(f"Ticket update error: {error}")
+        manage_message = "An error occurred while updating the ticket."
+        manage_error = True
+        if conn:
+            conn.rollback()
+    finally:
+        if cur:
+            cur.close()
+        if conn:
+            conn.close()
+
+    results = find_tickets('', show_resolved)
+    return render_template_string(
+        html_template,
+        results=results,
+        show_resolved=show_resolved,
+        manage_message=manage_message,
+        manage_error=manage_error
+    )
+
+@app.route('/tickets/delete', methods=['POST'])
+@login_required
+def delete_ticket():
+    if session.get('role') != 'admin_role':
+        return render_template_string(
+            html_template,
+            results=None,
+            manage_message="Access denied: admin only.",
+            manage_error=True
+        )
+
+    source = request.form.get('source', 'active')
+    show_resolved = source == 'resolved'
+    ticket_id_raw = request.form.get('ticket_id')
+
+    try:
+        ticket_id = int(ticket_id_raw)
+    except (TypeError, ValueError):
+        results = find_tickets('', show_resolved)
+        return render_template_string(
+            html_template,
+            results=results,
+            show_resolved=show_resolved,
+            manage_message="Invalid ticket ID.",
+            manage_error=True
+        )
+
+    conn = get_db_connection()
+    if not conn:
+        return render_template_string(
+            html_template,
+            results=None,
+            show_resolved=show_resolved,
+            manage_message="Service temporarily unavailable.",
+            manage_error=True
+        )
+
+    cur = None
+    manage_message = "Ticket deleted successfully."
+    manage_error = False
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT student_id, issue FROM tickets WHERE id = %s", (ticket_id,))
+        row = cur.fetchone()
+        if not row:
+            manage_message = "Ticket not found."
+            manage_error = True
+        else:
+            student_id, old_issue = row
+            set_trigger_user(cur, session.get('user_id'))
+            cur.execute("DELETE FROM tickets WHERE id = %s", (ticket_id,))
+
+            staff_id = session.get('user_id')
+            staff_value = int(staff_id) if staff_id is not None else None
+            old_data = {
+                "ticket_id": ticket_id,
+                "student_id": student_id,
+                "issue": old_issue
+            }
+            cur.execute(
+                """
+                UPDATE audit_log_ticket
+                   SET action = %s,
+                       staff_id = COALESCE(%s, staff_id),
+                       old_data = %s,
+                       new_data = NULL
+                 WHERE audit_id = (
+                        SELECT audit_id FROM audit_log_ticket
+                         WHERE ticket_id = %s AND action = 'DELETE'
+                         ORDER BY logged_at DESC
+                         LIMIT 1
+                    )
+                """,
+                ('TICKET_DELETE', staff_value, Json(old_data), ticket_id)
+            )
+            if cur.rowcount == 0:
+                cur.execute(
+                    "INSERT INTO audit_log_ticket (ticket_id, staff_id, action, old_data, new_data) VALUES (%s, %s, %s, %s, %s)",
+                    (ticket_id, staff_value, 'TICKET_DELETE', Json(old_data), None)
+                )
+
+            conn.commit()
+    except (Exception, psycopg2.Error) as error:
+        print(f"Ticket delete error: {error}")
+        manage_message = "An error occurred while deleting the ticket."
+        manage_error = True
+        if conn:
+            conn.rollback()
+    finally:
+        if cur:
+            cur.close()
+        if conn:
+            conn.close()
+
+    results = find_tickets('', show_resolved)
+    return render_template_string(
+        html_template,
+        results=results,
+        show_resolved=show_resolved,
+        manage_message=manage_message,
+        manage_error=manage_error
+    )
 
 # View all tickets
 @app.route('/view_all')
