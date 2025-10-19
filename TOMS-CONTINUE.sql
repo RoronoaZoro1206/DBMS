@@ -1,10 +1,3 @@
-SELECT * FROM STAFF_USERS
-SELECT * FROM STUDENTS 
-SELECT * FROM TICKETS
-
-CREATE ROLE admi_role
-CREATE ROLE support_role
-
 CREATE OR REPLACE PROCEDURE mark_ticket_resolved(p_ticket_id INT, p_admin_username TEXT)
 LANGUAGE plpgsql
 AS $$
