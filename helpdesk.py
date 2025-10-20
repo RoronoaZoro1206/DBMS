@@ -86,6 +86,21 @@ def set_trigger_user(cur, user_id):
         return
     cur.execute('SET session "app.user_id" = %s;', (str(value),))
 
+
+def normalize_role(role_value):
+    """Translate database role labels into canonical app roles."""
+    if not role_value:
+        return None
+    cleaned = role_value.strip().lower()
+    if cleaned in ("admin", "admin_role"):
+        return "admin_role"
+    if cleaned in ("support", "support_role", "support_staff"):
+        return "support_role"
+    if cleaned in ("student", "student_role", "student_staff"):
+        return "student_role"
+    return None
+
+
 def find_tickets(query_string, show_resolved=False):
     conn = get_db_connection()
     if not conn:
@@ -171,200 +186,233 @@ def login_required(f):
         return f(*args, **kwargs)
     return wrapper
 
-# CHANGE: Template updated for RBAC (hide/show login, ticket form, and search by role)
+# RBAC v2: role-specific dashboards
 html_template = """
 <!DOCTYPE html>
 <html lang="en">
 <head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>University Helpdesk</title>
-  <script src="https://cdn.tailwindcss.com"></script>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>University Helpdesk</title>
+    <script src="https://cdn.tailwindcss.com"></script>
 </head>
 <body class="bg-gray-50 font-sans text-gray-800">
-  <div class="max-w-5xl mx-auto p-6">
-    <header class="mb-10 text-center">
-      <h1 class="text-4xl font-bold text-gray-900">CCICT Helpdesk</h1>
-      <p class="text-gray-600 mt-2">DBMS Security Lab</p>
-      {% if session.get('logged_in') %}
-        <p class="text-sm mt-2">
-          Logged in as <span class="font-semibold">{{ session.get('username') }}</span>
-          ({{ session.get('role') }}) |
-          <a href="{{ url_for('logout') }}" class="text-blue-600 underline">Logout</a>
-        </p>
-      {% endif %}
-    </header>
-
-    <div class="grid md:grid-cols-2 gap-6">
-      <!-- Login Form (hidden after login) -->
-      {% if not session.get('logged_in') %}
-      <div class="bg-white rounded-2xl shadow-md p-6 hover:shadow-lg transition">
-        <h2 class="text-xl font-semibold mb-4">Login</h2>
-        <form action="/login" method="post" class="space-y-4" autocomplete="off">
-          <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-          <input type="text" name="username" placeholder="Username" required autocomplete="off"
-            class="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:outline-none">
-          <input type="password" name="password" placeholder="Password" required autocomplete="off"
-            class="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:outline-none">
-          <button type="submit"
-            class="w-full bg-blue-600 text-white font-medium py-2 px-4 rounded-lg hover:bg-blue-700 transition">
-            Log In
-          </button>
-          {% if login_message %}
-            <p class="text-red-500 text-sm text-center mt-2">{{ login_message }}</p>
-          {% endif %}
-        </form>
-      </div>
-      {% endif %}
-
-      <!-- New Ticket Form (visible only after login) -->
-      {% if session.get('logged_in') %}
-      <div class="bg-white rounded-2xl shadow-md p-6 hover:shadow-lg transition">
-        <h2 class="text-xl font-semibold mb-4">Create Ticket</h2>
-        <form action="/submit_ticket" method="post" class="space-y-4" autocomplete="off">
-          <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-          <input type="text" name="student_id" placeholder="Student ID" required autocomplete="off"
-          class="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-green-500 focus:outline-none">
-          <textarea name="issue" placeholder="Describe your issue..." rows="4" required autocomplete="off"
-            class="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-green-500 focus:outline-none"></textarea>
-          <button type="submit"
-            class="w-full bg-green-600 text-white font-medium py-2 px-4 rounded-lg hover:bg-green-700 transition">
-            Submit Ticket
-          </button>
-          {% if ticket_message %}
-            <p class="text-green-600 text-sm text-center mt-2">{{ ticket_message }}</p>
-          {% endif %}
-        </form>
-      </div>
-      {% endif %}
-
-      <!-- Student Registration (support + admin) -->
-      {% if session.get('logged_in') and session.get('role') in ['support_role', 'admin_role'] %}
-      <div class="bg-white rounded-2xl shadow-md p-6 hover:shadow-lg transition">
-        <h2 class="text-xl font-semibold mb-4">Add Student</h2>
-        <form action="/students/add" method="post" class="space-y-4" autocomplete="off">
-          <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-          <input type="text" name="student_name" placeholder="Full Name" required autocomplete="off"
-            class="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-500 focus:outline-none">
-          <input type="email" name="student_email" placeholder="Email" required autocomplete="off"
-            class="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-500 focus:outline-none">
-          <input type="text" name="student_phone" placeholder="Phone" autocomplete="off"
-          class="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-500 focus:outline-none">
-          <button type="submit"
-            class="w-full bg-indigo-600 text-white font-medium py-2 px-4 rounded-lg hover:bg-indigo-700 transition">
-            Save Student
-          </button>
-          {% if student_message %}
-            <p class="text-sm text-center mt-2 {% if student_error %}text-red-500{% else %}text-green-600{% endif %}">{{ student_message }}</p>
-          {% endif %}
-        </form>
-      </div>
-      {% endif %}
-    </div>
-
-    <!-- Ticket Search (admin only) -->
-    <div class="bg-white rounded-2xl shadow-md p-6 mt-8 hover:shadow-lg transition">
-      <h2 class="text-xl font-semibold mb-4">Search Tickets</h2>
-      {% if not session.get('logged_in') %}
-        <p class="text-gray-500 text-sm">Login to use this feature.</p>
-      {% elif session.get('role') != 'admin_role' %}
-        <p class="text-gray-500 text-sm">Search restricted to admin users.</p>
-      {% else %}
-                <form action="/search" method="get" class="flex flex-col md:flex-row gap-3" autocomplete="off">
-          <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-                    <input type="text" name="q" placeholder="Search for an issue..." autocomplete="off"
-            class="flex-1 px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-yellow-500 focus:outline-none">
-          <button type="submit"
-            class="bg-yellow-500 text-white font-medium py-2 px-6 rounded-lg hover:bg-yellow-600 transition">
-            Search
-          </button>
-          <button type="submit" name="show_resolved" value="true"
-            class="bg-purple-500 text-white font-medium py-2 px-6 rounded-lg hover:bg-purple-600 transition">
-            Resolved Tickets
-          </button>
-        </form>
-        
-        <!-- Button: View All Tickets -->
-        <div class="mt-4">
-          <a href="{{ url_for('view_all_tickets') }}"
-            class="inline-block bg-gray-700 text-white font-medium py-2 px-6 rounded-lg hover:bg-gray-800 transition">
-            View All Tickets
-          </a>
-        </div>
-        
-                {% if search_message %}
-                    <p class="text-red-500 text-sm mt-2">{{ search_message }}</p>
-                {% endif %}
-                {% if resolve_message %}
-                    <p class="text-green-600 text-sm mt-2">{{ resolve_message }}</p>
-                {% endif %}
-                {% if manage_message %}
-                    <p class="text-sm mt-2 {% if manage_error %}text-red-500{% else %}text-blue-600{% endif %}">{{ manage_message }}</p>
-                {% endif %}
-        <div class="mt-6">
-          {% if results is not none %}
-            <h3 class="text-lg font-semibold mb-2">{% if show_resolved %}Resolved Tickets{% else %}Active Tickets{% endif %}</h3>
-            {% if results %}
-              <ul class="space-y-2">
-                {% for ticket in results %}
-                                    <li class="p-3 bg-gray-50 rounded-lg border text-sm">
-                                        <div class="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
-                                            <div class="flex-1">
-                                                <span class="font-medium text-gray-900">Ticket #{{ ticket[0] }}</span>: {{ ticket[1] }}
-                                            </div>
-                                            <div class="flex flex-wrap items-center gap-2">
-                                                {% if not show_resolved %}
-                                                <form action="/resolve_ticket" method="post" class="inline">
-                                                    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-                                                    <input type="hidden" name="ticket_id" value="{{ ticket[0] }}">
-                                                    <button type="submit"
-                                                        class="bg-green-500 text-white text-xs font-medium py-1 px-3 rounded hover:bg-green-600 transition">
-                                                        Resolve
-                                                    </button>
-                                                </form>
-                                                {% endif %}
-                                                {% if session.get('role') == 'admin_role' %}
-                                                <form action="/tickets/edit" method="post" class="flex items-center gap-2" autocomplete="off">
-                                                    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-                                                    <input type="hidden" name="ticket_id" value="{{ ticket[0] }}">
-                                                    <input type="hidden" name="source" value="{% if show_resolved %}resolved{% else %}active{% endif %}">
-                                                    <input type="text" name="issue" value="{{ ticket[1]|e }}" class="border border-gray-300 rounded px-2 py-1 text-xs md:w-60" autocomplete="off">
-                                                    <button type="submit"
-                                                        class="bg-blue-500 text-white text-xs font-medium py-1 px-3 rounded hover:bg-blue-600 transition">
-                                                        Update
-                                                    </button>
-                                                </form>
-                                                <form action="/tickets/delete" method="post" class="inline" onsubmit="return confirm('Delete this ticket?');">
-                                                    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-                                                    <input type="hidden" name="ticket_id" value="{{ ticket[0] }}">
-                                                    <input type="hidden" name="source" value="{% if show_resolved %}resolved{% else %}active{% endif %}">
-                                                    <button type="submit"
-                                                        class="bg-red-500 text-white text-xs font-medium py-1 px-3 rounded hover:bg-red-600 transition">
-                                                        Delete
-                                                    </button>
-                                                </form>
-                                                {% endif %}
-                                            </div>
-                                        </div>
-                                    </li>
-                {% endfor %}
-              </ul>
-            {% else %}
-              <p class="text-gray-500 text-sm">No tickets found.</p>
+    <div class="max-w-6xl mx-auto p-6 space-y-6">
+        <header class="text-center">
+            <h1 class="text-4xl font-bold text-gray-900">CCICT Helpdesk</h1>
+            <p class="text-gray-600 mt-2">DBMS Security Lab</p>
+            {% if session.get('logged_in') %}
+                <p class="text-sm mt-2">
+                    Logged in as <span class="font-semibold">{{ session.get('username') }}</span>
+                    ({{ session.get('role') }}) |
+                    <a href="{{ url_for('logout') }}" class="text-blue-600 underline">Logout</a>
+                </p>
             {% endif %}
-          {% endif %}
-        </div>
-      {% endif %}
+        </header>
+
+        {% if access_message %}
+            <div class="rounded-lg border border-yellow-200 bg-yellow-50 p-3 text-sm text-yellow-700">
+                {{ access_message }}
+            </div>
+        {% endif %}
+
+        {% if not session.get('logged_in') %}
+            <section class="bg-white rounded-2xl shadow-md p-6 max-w-md mx-auto hover:shadow-lg transition">
+                <h2 class="text-xl font-semibold mb-4 text-center">Sign In</h2>
+                <form action="/login" method="post" class="space-y-4" autocomplete="off">
+                    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                    <input type="text" name="username" placeholder="Username" required autocomplete="off"
+                        class="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:outline-none">
+                    <input type="password" name="password" placeholder="Password" required autocomplete="off"
+                        class="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:outline-none">
+                    <button type="submit"
+                        class="w-full bg-blue-600 text-white font-medium py-2 px-4 rounded-lg hover:bg-blue-700 transition">
+                        Log In
+                    </button>
+                    {% if login_message %}
+                        <p class="text-red-500 text-sm text-center mt-2">{{ login_message }}</p>
+                    {% endif %}
+                </form>
+            </section>
+        {% elif session.get('role') == 'student_role' %}
+            <section class="bg-white rounded-2xl shadow-md p-6 hover:shadow-lg transition">
+                <h2 class="text-2xl font-semibold mb-4">Student Dashboard</h2>
+                <p class="text-sm text-gray-600 mb-4">Submit a helpdesk ticket. Support staff will contact you using the information on file.</p>
+                <form action="/submit_ticket" method="post" class="space-y-4" autocomplete="off">
+                    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                    <input type="text" name="student_id" placeholder="Student ID" required autocomplete="off"
+                        class="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-green-500 focus:outline-none">
+                    <textarea name="issue" placeholder="Describe your issue..." rows="4" required autocomplete="off"
+                        class="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-green-500 focus:outline-none"></textarea>
+                    <button type="submit"
+                        class="w-full bg-green-600 text-white font-medium py-2 px-4 rounded-lg hover:bg-green-700 transition">
+                        Submit Ticket
+                    </button>
+                    {% if ticket_message %}
+                        <p class="text-green-600 text-sm text-center mt-2">{{ ticket_message }}</p>
+                    {% endif %}
+                </form>
+            </section>
+        {% elif session.get('role') in ['support_role', 'admin_role'] %}
+            {% set is_admin = session.get('role') == 'admin_role' %}
+            <section class="grid gap-6 md:grid-cols-2">
+                <div class="bg-white rounded-2xl shadow-md p-6 hover:shadow-lg transition md:col-span-2">
+                    <h2 class="text-2xl font-semibold mb-4">
+                        {% if is_admin %}Administrator{% else %}Support{% endif %} Dashboard
+                    </h2>
+                    <p class="text-sm text-gray-600">
+                        Manage incoming tickets, submit requests on behalf of students, and keep the student directory up to date.
+                    </p>
+                </div>
+
+                <div class="bg-white rounded-2xl shadow-md p-6 hover:shadow-lg transition">
+                    <h3 class="text-xl font-semibold mb-4">Create Ticket</h3>
+                    <form action="/submit_ticket" method="post" class="space-y-4" autocomplete="off">
+                        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                        <input type="text" name="student_id" placeholder="Student ID" required autocomplete="off"
+                            class="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-green-500 focus:outline-none">
+                        <textarea name="issue" placeholder="Describe the issue..." rows="4" required autocomplete="off"
+                            class="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-green-500 focus:outline-none"></textarea>
+                        <button type="submit"
+                            class="w-full bg-green-600 text-white font-medium py-2 px-4 rounded-lg hover:bg-green-700 transition">
+                            Submit Ticket
+                        </button>
+                        {% if ticket_message %}
+                            <p class="text-green-600 text-sm text-center mt-2">{{ ticket_message }}</p>
+                        {% endif %}
+                    </form>
+                </div>
+
+                <div class="bg-white rounded-2xl shadow-md p-6 hover:shadow-lg transition">
+                    <h3 class="text-xl font-semibold mb-4">Ticket Management</h3>
+                    <form action="/search" method="get" class="flex flex-col md:flex-row gap-3" autocomplete="off">
+                        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                        <input type="text" name="q" placeholder="Search for an issue..." autocomplete="off"
+                            class="flex-1 px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:outline-none">
+                        <button type="submit"
+                            class="bg-blue-600 text-white font-medium py-2 px-6 rounded-lg hover:bg-blue-700 transition">
+                            Search
+                        </button>
+                        <button type="submit" name="show_resolved" value="true"
+                            class="bg-purple-500 text-white font-medium py-2 px-6 rounded-lg hover:bg-purple-600 transition">
+                            Resolved
+                        </button>
+                    </form>
+
+                    <div class="mt-4 flex flex-wrap gap-3">
+                        <a href="{{ url_for('view_all_tickets') }}"
+                            class="inline-block bg-gray-700 text-white font-medium py-2 px-6 rounded-lg hover:bg-gray-800 transition">
+                            View All Tickets
+                        </a>
+                        <a href="{{ url_for('students_restricted') }}"
+                            class="inline-block bg-indigo-600 text-white font-medium py-2 px-6 rounded-lg hover:bg-indigo-700 transition">
+                            Student Directory
+                        </a>
+                        {% if is_admin %}
+                        <a href="{{ url_for('students_full') }}"
+                            class="inline-block bg-red-600 text-white font-medium py-2 px-6 rounded-lg hover:bg-red-700 transition">
+                            Full Student Data
+                        </a>
+                        {% endif %}
+                    </div>
+
+                    {% if search_message %}
+                        <p class="text-red-500 text-sm mt-3">{{ search_message }}</p>
+                    {% endif %}
+                    {% if resolve_message %}
+                        <p class="text-green-600 text-sm mt-3">{{ resolve_message }}</p>
+                    {% endif %}
+                    {% if manage_message %}
+                        <p class="text-sm mt-3 {% if manage_error %}text-red-500{% else %}text-blue-600{% endif %}">{{ manage_message }}</p>
+                    {% endif %}
+
+                    <div class="mt-6">
+                        {% if results is not none %}
+                            <h4 class="text-lg font-semibold mb-2">
+                                {% if show_resolved %}Resolved Tickets{% else %}Active Tickets{% endif %}
+                            </h4>
+                            {% if results %}
+                                <ul class="space-y-2">
+                                    {% for ticket in results %}
+                                        <li class="p-3 bg-gray-50 rounded-lg border text-sm">
+                                            <div class="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
+                                                <div class="flex-1">
+                                                    <span class="font-medium text-gray-900">Ticket #{{ ticket[0] }}</span>: {{ ticket[1] }}
+                                                </div>
+                                                <div class="flex flex-wrap items-center gap-2">
+                                                    {% if not show_resolved %}
+                                                    <form action="/resolve_ticket" method="post" class="inline">
+                                                        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                                                        <input type="hidden" name="ticket_id" value="{{ ticket[0] }}">
+                                                        <button type="submit"
+                                                            class="bg-green-500 text-white text-xs font-medium py-1 px-3 rounded hover:bg-green-600 transition">
+                                                            Resolve
+                                                        </button>
+                                                    </form>
+                                                    {% endif %}
+                                                    {% if is_admin %}
+                                                    <form action="/tickets/edit" method="post" class="flex items-center gap-2" autocomplete="off">
+                                                        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                                                        <input type="hidden" name="ticket_id" value="{{ ticket[0] }}">
+                                                        <input type="hidden" name="source" value="{% if show_resolved %}resolved{% else %}active{% endif %}">
+                                                        <input type="text" name="issue" value="{{ ticket[1]|e }}" class="border border-gray-300 rounded px-2 py-1 text-xs md:w-60" autocomplete="off">
+                                                        <button type="submit"
+                                                            class="bg-blue-500 text-white text-xs font-medium py-1 px-3 rounded hover:bg-blue-600 transition">
+                                                            Update
+                                                        </button>
+                                                    </form>
+                                                    <form action="/tickets/delete" method="post" class="inline" onsubmit="return confirm('Delete this ticket?');">
+                                                        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                                                        <input type="hidden" name="ticket_id" value="{{ ticket[0] }}">
+                                                        <input type="hidden" name="source" value="{% if show_resolved %}resolved{% else %}active{% endif %}">
+                                                        <button type="submit"
+                                                            class="bg-red-500 text-white text-xs font-medium py-1 px-3 rounded hover:bg-red-600 transition">
+                                                            Delete
+                                                        </button>
+                                                    </form>
+                                                    {% endif %}
+                                                </div>
+                                            </div>
+                                        </li>
+                                    {% endfor %}
+                                </ul>
+                            {% else %}
+                                <p class="text-gray-500 text-sm">No tickets found.</p>
+                            {% endif %}
+                        {% endif %}
+                    </div>
+                </div>
+
+                <div class="bg-white rounded-2xl shadow-md p-6 hover:shadow-lg transition md:col-span-2">
+                    <h3 class="text-xl font-semibold mb-4">Add Student</h3>
+                    <form action="/students/add" method="post" class="grid gap-4 md:grid-cols-2" autocomplete="off">
+                        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                        <input type="text" name="student_name" placeholder="Full Name" required autocomplete="off"
+                            class="px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-500 focus:outline-none md:col-span-2">
+                        <input type="email" name="student_email" placeholder="Email" required autocomplete="off"
+                            class="px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-500 focus:outline-none md:col-span-1">
+                        <input type="text" name="student_phone" placeholder="Phone" autocomplete="off"
+                            class="px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-500 focus:outline-none md:col-span-1">
+                        <button type="submit"
+                            class="md:col-span-2 bg-indigo-600 text-white font-medium py-2 px-4 rounded-lg hover:bg-indigo-700 transition">
+                            Save Student
+                        </button>
+                        {% if student_message %}
+                            <p class="md:col-span-2 text-sm text-center {% if student_error %}text-red-500{% else %}text-green-600{% endif %}">
+                                {{ student_message }}
+                            </p>
+                        {% endif %}
+                    </form>
+                </div>
+            </section>
+        {% endif %}
+
+        {% if extra_content %}
+            <section class="bg-white rounded-2xl shadow-md p-6">
+                {{ extra_content|safe }}
+            </section>
+        {% endif %}
     </div>
-
-    <!-- Extra dynamic content (student listings etc.) -->
-    {% if extra_content %}
-      <div class="bg-white rounded-2xl shadow-md p-6 mt-8">
-        {{ extra_content|safe }}
-      </div>
-    {% endif %}
-
-  </div>
 </body>
 </html>
 """
@@ -397,7 +445,13 @@ def login():
         user = cur.fetchone()
         cur.close()
         if user:
-            normalized_role = 'admin_role' if user[2] in ('admin', 'admin_role') else 'support_role'
+            normalized_role = normalize_role(user[2])
+            if not normalized_role:
+                return render_template_string(
+                    html_template,
+                    login_message="Account role is not authorized. Contact the administrator.",
+                    results=None
+                )
             session.permanent = False  # Do not keep the session once the browser closes
             session['logged_in'] = True
             session['user_id'] = user[0]  # Store user ID for auditing
@@ -455,6 +509,12 @@ def logout():
 @app.route('/students')
 @login_required
 def students_restricted():
+    if session.get('role') not in ('support_role', 'admin_role'):
+        return render_template_string(
+            html_template,
+            results=None,
+            access_message="Access denied: support or admin role required."
+        )
     conn = get_db_connection()
     rows = []
     try:
@@ -477,7 +537,11 @@ def students_restricted():
 @login_required
 def students_full():
     if session.get('role') != 'admin_role':
-        return render_template_string(html_template, login_message="Access denied: admin only.", results=None)
+        return render_template_string(
+            html_template,
+            results=None,
+            access_message="Access denied: admin only."
+        )
     conn = get_db_connection()
     rows = []
     try:
@@ -502,9 +566,8 @@ def add_student():
     if session.get('role') not in ('support_role', 'admin_role'):
         return render_template_string(
             html_template,
-            student_message="Access denied: support or admin role required.",
-            student_error=True,
-            results=None
+            results=None,
+            access_message="Access denied: support or admin role required."
         )
 
     def render_student_feedback(message, is_error=False):
@@ -670,8 +733,8 @@ def search_tickets():
     if session.get('role') != 'admin_role':
         return render_template_string(
             html_template,
-            results=[],
-            search_message="Access denied: admin only."
+            results=None,
+            access_message="Access denied: admin only."
         )
     
     query = request.args.get('q', '').strip()
@@ -694,7 +757,7 @@ def resolve_ticket():
         return render_template_string(
             html_template,
             results=None,
-            search_message="Access denied: admin only."
+            access_message="Access denied: admin only."
         )
     
     ticket_id = request.form.get('ticket_id')
@@ -733,8 +796,7 @@ def edit_ticket():
         return render_template_string(
             html_template,
             results=None,
-            manage_message="Access denied: admin only.",
-            manage_error=True
+            access_message="Access denied: admin only."
         )
 
     source = request.form.get('source', 'active')
@@ -862,8 +924,7 @@ def delete_ticket():
         return render_template_string(
             html_template,
             results=None,
-            manage_message="Access denied: admin only.",
-            manage_error=True
+            access_message="Access denied: admin only."
         )
 
     source = request.form.get('source', 'active')
@@ -967,8 +1028,8 @@ def view_all_tickets():
     if session.get('role') != 'admin_role':
         return render_template_string(
             html_template,
-            results=[],
-            search_message="Access denied: admin only."
+            results=None,
+            access_message="Access denied: admin only."
         )
 
     conn = get_db_connection()
