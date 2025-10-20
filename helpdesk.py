@@ -76,6 +76,126 @@ def get_db_connection():
         print("Error: Unable to connect to the database.", e)
         return None
 
+
+def normalize_role(role_value):
+    if not role_value:
+        return None
+    cleaned = role_value.strip().lower()
+    if cleaned in ('admin', 'admin_role'):
+        return 'admin_role'
+    if cleaned in ('support', 'support_role'):
+        return 'support_role'
+    return None
+
+
+def get_ticket_status_counts():
+    totals = {'open': 0, 'resolved': 0}
+    conn = get_db_connection()
+    if not conn:
+        return totals
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT
+                COALESCE(SUM(CASE WHEN issue LIKE '%%[Resolved by admin%%' THEN 1 ELSE 0 END), 0) AS resolved_count,
+                COALESCE(SUM(CASE WHEN issue LIKE '%%[Resolved by admin%%' THEN 0 ELSE 1 END), 0) AS open_count
+            FROM tickets;
+            """
+        )
+        row = cur.fetchone()
+        if row:
+            totals['resolved'] = int(row[0] or 0)
+            totals['open'] = int(row[1] or 0)
+        cur.close()
+        return totals
+    except (Exception, psycopg2.Error) as error:
+        print(f"Ticket status aggregation error: {error}")
+        return totals
+    finally:
+        if conn:
+            conn.close()
+
+
+def base_view_context(**overrides):
+    context = {
+        'results': [],
+        'show_resolved': False,
+        'login_message': None,
+        'ticket_message': None,
+        'student_message': None,
+        'student_error': False,
+        'account_message': None,
+        'account_error': False,
+        'search_message': None,
+        'resolve_message': None,
+        'manage_message': None,
+        'manage_error': False,
+        'extra_content': None,
+        'access_message': None,
+        'chart_labels': [],
+        'chart_values': [],
+        'metrics': {},
+        'chart_configs': [],
+        'audit_entries': [],
+        'active_page': 'dashboard',
+        'page_title': None,
+        'page_description': None,
+        'student_rows': [],
+        'full_student_rows': [],
+        'accounts': []
+    }
+    if session.get('logged_in') and session.get('role') in ('support_role', 'admin_role'):
+        counts = get_ticket_status_counts()
+        context['chart_labels'] = ['Open Tickets', 'Resolved Tickets']
+        context['chart_values'] = [counts['open'], counts['resolved']]
+        context['metrics'] = counts
+        chart_configs = [
+            {
+                'id': 'chart-ticket-status',
+                'type': 'doughnut',
+                'title_text': 'Ticket Status',
+                'dataset_label': 'Tickets',
+                'labels': ['Open', 'Resolved'],
+                'data': [counts['open'], counts['resolved']],
+                'background_color': ['#2563eb', '#16a34a'],
+                'legend_position': 'bottom',
+                'height': 220
+            }
+        ]
+        if session.get('role') == 'admin_role':
+            staff_counts = get_staff_role_counts()
+            entity_counts = get_entity_counts()
+            chart_configs.append(
+                {
+                    'id': 'chart-staff-roles',
+                    'type': 'bar',
+                    'title_text': 'Staff Accounts by Role',
+                    'dataset_label': 'Accounts',
+                    'labels': ['Administrators', 'Support'],
+                    'data': [staff_counts.get('admin_role', 0), staff_counts.get('support_role', 0)],
+                    'background_color': ['#7c3aed', '#0ea5e9'],
+                    'legend_position': 'top',
+                    'height': 220
+                }
+            )
+            chart_configs.append(
+                {
+                    'id': 'chart-entity-distribution',
+                    'type': 'bar',
+                    'title_text': 'Records Overview',
+                    'dataset_label': 'Totals',
+                    'labels': ['Students', 'Tickets'],
+                    'data': [entity_counts.get('students', 0), entity_counts.get('tickets', 0)],
+                    'background_color': ['#f97316', '#22c55e'],
+                    'legend_position': 'top',
+                    'height': 220
+                }
+            )
+        context['chart_configs'] = chart_configs
+    context.update(overrides)
+    return context
+
 def set_trigger_user(cur, user_id):
     """Set the session variable consumed by audit triggers."""
     if user_id is None:
@@ -85,21 +205,6 @@ def set_trigger_user(cur, user_id):
     except (TypeError, ValueError):
         return
     cur.execute('SET session "app.user_id" = %s;', (str(value),))
-
-
-def normalize_role(role_value):
-    """Translate database role labels into canonical app roles."""
-    if not role_value:
-        return None
-    cleaned = role_value.strip().lower()
-    if cleaned in ("admin", "admin_role"):
-        return "admin_role"
-    if cleaned in ("support", "support_role", "support_staff"):
-        return "support_role"
-    if cleaned in ("student", "student_role", "student_staff"):
-        return "student_role"
-    return None
-
 
 def find_tickets(query_string, show_resolved=False):
     conn = get_db_connection()
@@ -119,10 +224,16 @@ def find_tickets(query_string, show_resolved=False):
                 sql_query = "SELECT id, issue FROM tickets WHERE issue LIKE '%%[Resolved by admin%%' ORDER BY id;"
                 cur.execute(sql_query)
         else:
-            # Original logic: Show only unresolved tickets
-            sql_query = "SELECT id, issue FROM tickets WHERE issue ILIKE %s AND issue NOT LIKE '%%[Resolved by admin%%' ORDER BY id;"
-            search_pattern = f"%{query_string}%"
-            cur.execute(sql_query, (search_pattern,))
+            # Show unresolved (open) tickets
+            if query_string:
+                # Search within open tickets
+                sql_query = "SELECT id, issue FROM tickets WHERE issue ILIKE %s AND issue NOT LIKE '%%[Resolved by admin%%' ORDER BY id;"
+                search_pattern = f"%{query_string}%"
+                cur.execute(sql_query, (search_pattern,))
+            else:
+                # Show all open tickets (no query required)
+                sql_query = "SELECT id, issue FROM tickets WHERE issue NOT LIKE '%%[Resolved by admin%%' ORDER BY id;"
+                cur.execute(sql_query)
         
         results = cur.fetchall()
         cur.close()
@@ -133,6 +244,191 @@ def find_tickets(query_string, show_resolved=False):
     finally:
         if conn:
             conn.close()
+
+
+def load_restricted_students():
+    conn = get_db_connection()
+    if not conn:
+        return []
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT id, name, email FROM v_students_support ORDER BY id;")
+        rows = cur.fetchall()
+        cur.close()
+        return rows
+    except (Exception, psycopg2.Error) as error:
+        print(f"Restricted student lookup error: {error}")
+        return []
+    finally:
+        if conn:
+            conn.close()
+
+
+def load_full_students():
+    conn = get_db_connection()
+    if not conn:
+        return []
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT id, name, email, phone FROM students ORDER BY id;")
+        rows = cur.fetchall()
+        cur.close()
+        return rows
+    except (Exception, psycopg2.Error) as error:
+        print(f"Full student lookup error: {error}")
+        return []
+    finally:
+        if conn:
+            conn.close()
+
+
+def load_staff_accounts():
+    conn = get_db_connection()
+    if not conn:
+        return []
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT id, username, role FROM staff_users ORDER BY id;")
+        rows = cur.fetchall()
+        cur.close()
+        return [{'id': row[0], 'username': row[1], 'role': row[2]} for row in rows]
+    except (Exception, psycopg2.Error) as error:
+        print(f"Staff account lookup error: {error}")
+        return []
+    finally:
+        if conn:
+            conn.close()
+
+
+def get_staff_role_counts():
+    counts = {'admin_role': 0, 'support_role': 0}
+    conn = get_db_connection()
+    if not conn:
+        return counts
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT role, COUNT(*) FROM staff_users GROUP BY role;")
+        for role, total in cur.fetchall():
+            counts[role] = int(total or 0)
+        cur.close()
+        return counts
+    except (Exception, psycopg2.Error) as error:
+        print(f"Staff role aggregation error: {error}")
+        return counts
+    finally:
+        if conn:
+            conn.close()
+
+
+def get_entity_counts():
+    counts = {'students': 0, 'tickets': 0}
+    conn = get_db_connection()
+    if not conn:
+        return counts
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM students;")
+        counts['students'] = int(cur.fetchone()[0] or 0)
+        cur.execute("SELECT COUNT(*) FROM tickets;")
+        counts['tickets'] = int(cur.fetchone()[0] or 0)
+        cur.close()
+        return counts
+    except (Exception, psycopg2.Error) as error:
+        print(f"Entity count aggregation error: {error}")
+        return counts
+    finally:
+        if conn:
+            conn.close()
+
+
+def load_audit_entries(limit=50):
+    conn = get_db_connection()
+    if not conn:
+        return []
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT audit_id, staff_id, action, logged_at, old_data, new_data
+              FROM audit_log
+             ORDER BY audit_id DESC
+             LIMIT %s;
+            """,
+            (limit,)
+        )
+        rows = cur.fetchall()
+        cur.close()
+        entries = []
+        for row in rows:
+            entries.append(
+                {
+                    'audit_id': row[0],
+                    'staff_id': row[1],
+                    'action': row[2],
+                    'logged_at': row[3],
+                    'old_data': row[4],
+                    'new_data': row[5],
+                }
+            )
+        return entries
+    except (Exception, psycopg2.Error) as error:
+        print(f"Audit log load error: {error}")
+        return []
+    finally:
+        if conn:
+            conn.close()
+
+
+def ticket_view_context(**overrides):
+    role = session.get('role')
+    description = "Create and manage helpdesk tickets." if role == 'admin_role' else "Create tickets for student issues."
+    context = {
+        'active_page': 'tickets',
+        'page_title': 'Ticket Queue',
+        'page_description': description,
+        'show_resolved': overrides.get('show_resolved', False)
+    }
+    context.update(overrides)
+    return base_view_context(**context)
+
+
+def render_ticket_page(**overrides):
+    show_resolved = overrides.get('show_resolved', False)
+    if 'results' not in overrides:
+        overrides['results'] = find_tickets('', show_resolved) if session.get('role') == 'admin_role' else []
+    overrides.setdefault('show_resolved', show_resolved)
+    return render_template_string(html_template, **ticket_view_context(**overrides))
+
+
+def sensitive_students_context(message=None, is_error=False):
+    return base_view_context(
+        active_page='sensitive',
+        page_title='Sensitive Records',
+        page_description='Admin-only student contact information.',
+        full_student_rows=load_full_students(),
+        student_message=message,
+        student_error=is_error
+    )
+
+
+def accounts_view_context(message=None, is_error=False):
+    return base_view_context(
+        active_page='accounts',
+        page_title='Account Administration',
+        page_description='Provision and review staff login credentials.',
+        accounts=load_staff_accounts(),
+        account_message=message,
+        account_error=is_error
+    )
+
+
+def audit_view_context():
+    return base_view_context(
+        active_page='audits',
+        page_title='Audit Log',
+        page_description='Review recent helpdesk actions recorded for compliance.',
+        audit_entries=load_audit_entries()
+    )
 
 def mark_ticket_as_resolved(ticket_id, admin_username, user_id=None):
     conn = get_db_connection()
@@ -155,8 +451,8 @@ def mark_ticket_as_resolved(ticket_id, admin_username, user_id=None):
         }
         staff_id = int(user_id) if user_id is not None else None
         cur.execute(
-            "INSERT INTO audit_log_ticket (ticket_id, staff_id, action, old_data, new_data) VALUES (%s, %s, %s, %s, %s)",
-            (ticket_id, staff_id, 'TICKET_RESOLVE', None, Json(audit_payload))
+            "INSERT INTO audit_log (staff_id, action, old_data, new_data) VALUES (%s, %s, %s, %s)",
+            (staff_id, 'TICKET_RESOLVE', None, Json(audit_payload))
         )
 
         conn.commit()
@@ -186,7 +482,7 @@ def login_required(f):
         return f(*args, **kwargs)
     return wrapper
 
-# RBAC v2: role-specific dashboards
+# Role-aware dashboard template with sidebar and charts
 html_template = """
 <!DOCTYPE html>
 <html lang="en">
@@ -195,224 +491,538 @@ html_template = """
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>University Helpdesk</title>
     <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 </head>
-<body class="bg-gray-50 font-sans text-gray-800">
-    <div class="max-w-6xl mx-auto p-6 space-y-6">
-        <header class="text-center">
-            <h1 class="text-4xl font-bold text-gray-900">CCICT Helpdesk</h1>
-            <p class="text-gray-600 mt-2">DBMS Security Lab</p>
-            {% if session.get('logged_in') %}
-                <p class="text-sm mt-2">
-                    Logged in as <span class="font-semibold">{{ session.get('username') }}</span>
-                    ({{ session.get('role') }}) |
-                    <a href="{{ url_for('logout') }}" class="text-blue-600 underline">Logout</a>
-                </p>
-            {% endif %}
+<body class="bg-gray-100 font-sans text-gray-800">
+    <div class="min-h-screen">
+        <header class="bg-white shadow-sm">
+            <div class="max-w-6xl mx-auto flex items-center justify-between px-6 py-4">
+                <div>
+                    <h1 class="text-2xl font-semibold text-gray-900">CCICT Helpdesk</h1>
+                    <p class="text-sm text-gray-500">DBMS Security Lab</p>
+                </div>
+                {% if session.get('logged_in') %}
+                <div class="text-right">
+                    <p class="text-sm font-semibold text-gray-800">{{ session.get('username') }}</p>
+                    <p class="text-xs uppercase tracking-wide text-gray-500">{{ session.get('role') }}</p>
+                    <a href="{{ url_for('logout') }}" class="mt-2 inline-block text-xs font-medium text-blue-600 underline">Logout</a>
+                </div>
+                {% endif %}
+            </div>
         </header>
 
-        {% if access_message %}
-            <div class="rounded-lg border border-yellow-200 bg-yellow-50 p-3 text-sm text-yellow-700">
+        <main class="max-w-6xl mx-auto px-6 py-8">
+            {% if access_message %}
+            <div class="mb-6 rounded-lg border border-yellow-200 bg-yellow-50 px-4 py-3 text-sm text-yellow-700">
                 {{ access_message }}
             </div>
-        {% endif %}
+            {% endif %}
 
-        {% if not session.get('logged_in') %}
-            <section class="bg-white rounded-2xl shadow-md p-6 max-w-md mx-auto hover:shadow-lg transition">
-                <h2 class="text-xl font-semibold mb-4 text-center">Sign In</h2>
-                <form action="/login" method="post" class="space-y-4" autocomplete="off">
+            {% if not session.get('logged_in') %}
+            <section class="mx-auto max-w-md rounded-2xl bg-white p-6 shadow">
+                <h2 class="text-xl font-semibold text-center">Sign In</h2>
+                <p class="mt-1 text-center text-sm text-gray-500">Enter your support or admin credentials to continue.</p>
+                <form action="/login" method="post" class="mt-6 space-y-4" autocomplete="off">
                     <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-                    <input type="text" name="username" placeholder="Username" required autocomplete="off"
-                        class="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:outline-none">
-                    <input type="password" name="password" placeholder="Password" required autocomplete="off"
-                        class="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:outline-none">
+                    <div>
+                        <label class="text-xs font-medium text-gray-600">Username</label>
+                        <input type="text" name="username" required autocomplete="off"
+                            class="mt-1 w-full rounded-lg border border-gray-300 px-3 py-2 focus:ring-2 focus:ring-blue-500 focus:outline-none">
+                    </div>
+                    <div>
+                        <label class="text-xs font-medium text-gray-600">Password</label>
+                        <input type="password" name="password" required autocomplete="off"
+                            class="mt-1 w-full rounded-lg border border-gray-300 px-3 py-2 focus:ring-2 focus:ring-blue-500 focus:outline-none">
+                    </div>
                     <button type="submit"
-                        class="w-full bg-blue-600 text-white font-medium py-2 px-4 rounded-lg hover:bg-blue-700 transition">
-                        Log In
-                    </button>
+                        class="w-full rounded-lg bg-blue-600 py-2 text-sm font-semibold text-white hover:bg-blue-700 transition">Log In</button>
                     {% if login_message %}
-                        <p class="text-red-500 text-sm text-center mt-2">{{ login_message }}</p>
+                    <p class="text-center text-xs font-medium text-red-500">{{ login_message }}</p>
                     {% endif %}
                 </form>
             </section>
-        {% elif session.get('role') == 'student_role' %}
-            <section class="bg-white rounded-2xl shadow-md p-6 hover:shadow-lg transition">
-                <h2 class="text-2xl font-semibold mb-4">Student Dashboard</h2>
-                <p class="text-sm text-gray-600 mb-4">Submit a helpdesk ticket. Support staff will contact you using the information on file.</p>
-                <form action="/submit_ticket" method="post" class="space-y-4" autocomplete="off">
-                    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-                    <input type="text" name="student_id" placeholder="Student ID" required autocomplete="off"
-                        class="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-green-500 focus:outline-none">
-                    <textarea name="issue" placeholder="Describe your issue..." rows="4" required autocomplete="off"
-                        class="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-green-500 focus:outline-none"></textarea>
-                    <button type="submit"
-                        class="w-full bg-green-600 text-white font-medium py-2 px-4 rounded-lg hover:bg-green-700 transition">
-                        Submit Ticket
-                    </button>
-                    {% if ticket_message %}
-                        <p class="text-green-600 text-sm text-center mt-2">{{ ticket_message }}</p>
-                    {% endif %}
-                </form>
-            </section>
-        {% elif session.get('role') in ['support_role', 'admin_role'] %}
-            {% set is_admin = session.get('role') == 'admin_role' %}
-            <section class="grid gap-6 md:grid-cols-2">
-                <div class="bg-white rounded-2xl shadow-md p-6 hover:shadow-lg transition md:col-span-2">
-                    <h2 class="text-2xl font-semibold mb-4">
-                        {% if is_admin %}Administrator{% else %}Support{% endif %} Dashboard
-                    </h2>
-                    <p class="text-sm text-gray-600">
-                        Manage incoming tickets, submit requests on behalf of students, and keep the student directory up to date.
-                    </p>
-                </div>
 
-                <div class="bg-white rounded-2xl shadow-md p-6 hover:shadow-lg transition">
-                    <h3 class="text-xl font-semibold mb-4">Create Ticket</h3>
-                    <form action="/submit_ticket" method="post" class="space-y-4" autocomplete="off">
-                        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-                        <input type="text" name="student_id" placeholder="Student ID" required autocomplete="off"
-                            class="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-green-500 focus:outline-none">
-                        <textarea name="issue" placeholder="Describe the issue..." rows="4" required autocomplete="off"
-                            class="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-green-500 focus:outline-none"></textarea>
-                        <button type="submit"
-                            class="w-full bg-green-600 text-white font-medium py-2 px-4 rounded-lg hover:bg-green-700 transition">
-                            Submit Ticket
-                        </button>
-                        {% if ticket_message %}
-                            <p class="text-green-600 text-sm text-center mt-2">{{ ticket_message }}</p>
-                        {% endif %}
-                    </form>
-                </div>
-
-                <div class="bg-white rounded-2xl shadow-md p-6 hover:shadow-lg transition">
-                    <h3 class="text-xl font-semibold mb-4">Ticket Management</h3>
-                    <form action="/search" method="get" class="flex flex-col md:flex-row gap-3" autocomplete="off">
-                        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-                        <input type="text" name="q" placeholder="Search for an issue..." autocomplete="off"
-                            class="flex-1 px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:outline-none">
-                        <button type="submit"
-                            class="bg-blue-600 text-white font-medium py-2 px-6 rounded-lg hover:bg-blue-700 transition">
-                            Search
-                        </button>
-                        <button type="submit" name="show_resolved" value="true"
-                            class="bg-purple-500 text-white font-medium py-2 px-6 rounded-lg hover:bg-purple-600 transition">
-                            Resolved
-                        </button>
-                    </form>
-
-                    <div class="mt-4 flex flex-wrap gap-3">
-                        <a href="{{ url_for('view_all_tickets') }}"
-                            class="inline-block bg-gray-700 text-white font-medium py-2 px-6 rounded-lg hover:bg-gray-800 transition">
-                            View All Tickets
-                        </a>
-                        <a href="{{ url_for('students_restricted') }}"
-                            class="inline-block bg-indigo-600 text-white font-medium py-2 px-6 rounded-lg hover:bg-indigo-700 transition">
-                            Student Directory
-                        </a>
-                        {% if is_admin %}
-                        <a href="{{ url_for('students_full') }}"
-                            class="inline-block bg-red-600 text-white font-medium py-2 px-6 rounded-lg hover:bg-red-700 transition">
-                            Full Student Data
-                        </a>
-                        {% endif %}
+            {% else %}
+            <div class="flex flex-col gap-6 lg:flex-row">
+                <aside class="w-full rounded-2xl bg-white p-6 shadow lg:w-64">
+                    <div class="border-b pb-4">
+                        <p class="text-sm font-semibold text-gray-800">{{ session.get('username') }}</p>
+                        <p class="text-xs text-gray-500">{% if session.get('role') == 'admin_role' %}Administrator{% else %}Support Specialist{% endif %}</p>
                     </div>
+                    <nav class="mt-4 space-y-1 text-sm">
+                        <a href="{{ url_for('index') }}" class="flex items-center gap-3 rounded-lg px-3 py-2 {% if active_page == 'dashboard' %}bg-gray-900 text-white{% else %}text-gray-600 hover:bg-gray-100{% endif %}">
+                            <span>📊</span><span>Dashboard</span>
+                        </a>
+                        <a href="{{ url_for('view_all_tickets') }}" class="flex items-center gap-3 rounded-lg px-3 py-2 {% if active_page == 'tickets' %}bg-gray-900 text-white{% else %}text-gray-600 hover:bg-gray-100{% endif %}">
+                            <span>🎟️</span><span>Ticket Queue</span>
+                        </a>
+                        {% if session.get('role') == 'support_role' %}
+                        <a href="{{ url_for('students_restricted') }}" class="flex items-center gap-3 rounded-lg px-3 py-2 {% if active_page == 'students' %}bg-gray-900 text-white{% else %}text-gray-600 hover:bg-gray-100{% endif %}">
+                            <span>🧑‍🎓</span><span>Student Directory</span>
+                        </a>
+                        {% endif %}
+                        {% if session.get('role') == 'admin_role' %}
+                        <a href="{{ url_for('students_full') }}" class="flex items-center gap-3 rounded-lg px-3 py-2 {% if active_page == 'sensitive' %}bg-gray-900 text-white{% else %}text-gray-600 hover:bg-gray-100{% endif %}">
+                            <span>📚</span><span>Sensitive Records</span>
+                        </a>
+                        <a href="{{ url_for('accounts_admin') }}" class="flex items-center gap-3 rounded-lg px-3 py-2 {% if active_page == 'accounts' %}bg-gray-900 text-white{% else %}text-gray-600 hover:bg-gray-100{% endif %}">
+                            <span>🛠️</span><span>Account Admin</span>
+                        </a>
+                        <a href="{{ url_for('audit_log_view') }}" class="flex items-center gap-3 rounded-lg px-3 py-2 {% if active_page == 'audits' %}bg-gray-900 text-white{% else %}text-gray-600 hover:bg-gray-100{% endif %}">
+                            <span>🗒️</span><span>Audit Log</span>
+                        </a>
+                        {% endif %}
+                    </nav>
+                </aside>
 
-                    {% if search_message %}
-                        <p class="text-red-500 text-sm mt-3">{{ search_message }}</p>
+                <section class="flex-1 space-y-6">
+                    {% if active_page == 'dashboard' %}
+                    <div class="grid gap-4 md:grid-cols-3">
+                        <div class="rounded-2xl bg-white p-6 shadow">
+                            <p class="text-xs font-semibold uppercase text-blue-600">Open Tickets</p>
+                            <p class="mt-2 text-3xl font-bold text-blue-900">{{ metrics.open or 0 }}</p>
+                            <p class="mt-3 text-xs text-gray-500">Tickets awaiting action from the support team.</p>
+                        </div>
+                        <div class="rounded-2xl bg-white p-6 shadow">
+                            <p class="text-xs font-semibold uppercase text-green-600">Resolved Tickets</p>
+                            <p class="mt-2 text-3xl font-bold text-green-900">{{ metrics.resolved or 0 }}</p>
+                            <p class="mt-3 text-xs text-gray-500">Successfully closed tickets this term.</p>
+                        </div>
+                        <div class="rounded-2xl bg-white p-6 shadow">
+                            <p class="text-xs font-semibold uppercase text-gray-500">Quick Links</p>
+                            <div class="mt-3 flex flex-wrap gap-2 text-xs">
+                                <a href="{{ url_for('view_all_tickets') }}" class="rounded-full bg-gray-200 px-3 py-1">Ticket Queue</a>
+                                {% if session.get('role') == 'support_role' %}
+                                <a href="{{ url_for('students_restricted') }}" class="rounded-full bg-gray-200 px-3 py-1">Directory</a>
+                                {% endif %}
+                                {% if session.get('role') == 'admin_role' %}
+                                <a href="{{ url_for('students_full') }}" class="rounded-full bg-gray-200 px-3 py-1">Sensitive Records</a>
+                                <a href="{{ url_for('accounts_admin') }}" class="rounded-full bg-gray-200 px-3 py-1">Account Admin</a>
+                                <a href="{{ url_for('audit_log_view') }}" class="rounded-full bg-gray-200 px-3 py-1">Audit Log</a>
+                                {% endif %}
+                            </div>
+                            <p class="mt-4 text-xs text-gray-500">Navigate to the tools you need using the shortcuts above.</p>
+                        </div>
+                    </div>
+                    {% if chart_configs %}
+                    {% set chart_count = chart_configs|length %}
+                    <div class="grid gap-4 mt-4 {% if chart_count == 2 %}md:grid-cols-2{% elif chart_count >= 3 %}md:grid-cols-2 xl:grid-cols-3{% endif %}">
+                        {% for chart in chart_configs %}
+                        <div class="rounded-2xl bg-white p-6 shadow flex flex-col">
+                            <div class="flex items-center justify-between">
+                                <h4 class="text-sm font-semibold text-gray-700">{{ chart.title_text }}</h4>
+                                {% if chart.dataset_label %}
+                                <span class="text-[10px] uppercase tracking-widest text-gray-400">{{ chart.dataset_label }}</span>
+                                {% endif %}
+                            </div>
+                            <div class="mt-4 h-56">
+                                <canvas id="{{ chart.id }}" height="{{ chart.height or 220 }}"></canvas>
+                            </div>
+                        </div>
+                        {% endfor %}
+                    </div>
                     {% endif %}
-                    {% if resolve_message %}
-                        <p class="text-green-600 text-sm mt-3">{{ resolve_message }}</p>
-                    {% endif %}
-                    {% if manage_message %}
-                        <p class="text-sm mt-3 {% if manage_error %}text-red-500{% else %}text-blue-600{% endif %}">{{ manage_message }}</p>
+                    <div class="mt-4 rounded-2xl bg-white p-6 shadow">
+                        <p class="text-sm text-gray-600">Use the navigation menu to create tickets, update student records, and manage staff accounts. Dashboard insights update automatically as data changes.</p>
+                    </div>
                     {% endif %}
 
-                    <div class="mt-6">
-                        {% if results is not none %}
-                            <h4 class="text-lg font-semibold mb-2">
-                                {% if show_resolved %}Resolved Tickets{% else %}Active Tickets{% endif %}
-                            </h4>
-                            {% if results %}
-                                <ul class="space-y-2">
-                                    {% for ticket in results %}
-                                        <li class="p-3 bg-gray-50 rounded-lg border text-sm">
-                                            <div class="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
-                                                <div class="flex-1">
-                                                    <span class="font-medium text-gray-900">Ticket #{{ ticket[0] }}</span>: {{ ticket[1] }}
-                                                </div>
-                                                <div class="flex flex-wrap items-center gap-2">
-                                                    {% if not show_resolved %}
-                                                    <form action="/resolve_ticket" method="post" class="inline">
-                                                        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-                                                        <input type="hidden" name="ticket_id" value="{{ ticket[0] }}">
-                                                        <button type="submit"
-                                                            class="bg-green-500 text-white text-xs font-medium py-1 px-3 rounded hover:bg-green-600 transition">
-                                                            Resolve
-                                                        </button>
-                                                    </form>
-                                                    {% endif %}
-                                                    {% if is_admin %}
-                                                    <form action="/tickets/edit" method="post" class="flex items-center gap-2" autocomplete="off">
-                                                        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-                                                        <input type="hidden" name="ticket_id" value="{{ ticket[0] }}">
-                                                        <input type="hidden" name="source" value="{% if show_resolved %}resolved{% else %}active{% endif %}">
-                                                        <input type="text" name="issue" value="{{ ticket[1]|e }}" class="border border-gray-300 rounded px-2 py-1 text-xs md:w-60" autocomplete="off">
-                                                        <button type="submit"
-                                                            class="bg-blue-500 text-white text-xs font-medium py-1 px-3 rounded hover:bg-blue-600 transition">
-                                                            Update
-                                                        </button>
-                                                    </form>
-                                                    <form action="/tickets/delete" method="post" class="inline" onsubmit="return confirm('Delete this ticket?');">
-                                                        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-                                                        <input type="hidden" name="ticket_id" value="{{ ticket[0] }}">
-                                                        <input type="hidden" name="source" value="{% if show_resolved %}resolved{% else %}active{% endif %}">
-                                                        <button type="submit"
-                                                            class="bg-red-500 text-white text-xs font-medium py-1 px-3 rounded hover:bg-red-600 transition">
-                                                            Delete
-                                                        </button>
-                                                    </form>
-                                                    {% endif %}
-                                                </div>
-                                            </div>
-                                        </li>
-                                    {% endfor %}
-                                </ul>
-                            {% else %}
-                                <p class="text-gray-500 text-sm">No tickets found.</p>
+                    {% if active_page == 'tickets' %}
+                    <div class="grid gap-6 {% if session.get('role') == 'admin_role' %}lg:grid-cols-2{% else %}lg:grid-cols-1{% endif %}">
+                        <section class="rounded-2xl bg-white p-6 shadow space-y-4">
+                            <h3 class="text-lg font-semibold">Create Ticket</h3>
+                            <p class="text-sm text-gray-500">Provide the student ID and a short description to log a new helpdesk ticket.</p>
+                            <form action="/submit_ticket" method="post" class="space-y-3" autocomplete="off">
+                                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                                <input type="text" name="student_id" placeholder="Student ID" required autocomplete="off"
+                                    class="w-full rounded-lg border border-gray-300 px-3 py-2 focus:ring-2 focus:ring-blue-500 focus:outline-none">
+                                <textarea name="issue" placeholder="Describe the issue..." rows="4" required autocomplete="off"
+                                    class="w-full rounded-lg border border-gray-300 px-3 py-2 focus:ring-2 focus:ring-blue-500 focus:outline-none"></textarea>
+                                <button type="submit"
+                                    class="w-full rounded-lg bg-blue-600 py-2 text-sm font-semibold text-white hover:bg-blue-700 transition">Submit Ticket</button>
+                            </form>
+                            {% if ticket_message %}
+                            <p class="text-xs font-medium text-center {% if 'error' in ticket_message|lower %}text-red-500{% else %}text-green-600{% endif %}">{{ ticket_message }}</p>
                             {% endif %}
+                        </section>
+                        {% if session.get('role') == 'admin_role' %}
+                        <section class="rounded-2xl bg-white p-6 shadow space-y-4">
+                            <h3 class="text-lg font-semibold">Ticket Search</h3>
+                            <p class="text-sm text-gray-500">Search tickets by keyword. Use the Open/Resolved toggle in Manage Tickets below to filter by status.</p>
+                            <form action="/search" method="get" class="flex flex-col gap-3 md:flex-row" autocomplete="off">
+                                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                                <input type="hidden" name="show_resolved" value="{{ 'true' if show_resolved else 'false' }}">
+                                <input type="text" name="q" placeholder="Search tickets" value="{{ request.args.get('q', '') }}" autocomplete="off"
+                                    class="w-full rounded-lg border border-gray-300 px-3 py-2 focus:ring-2 focus:ring-yellow-500 focus:outline-none md:flex-1">
+                                <button type="submit"
+                                    class="w-full rounded-lg bg-yellow-500 px-4 py-2 text-sm font-semibold text-white transition hover:bg-yellow-600 md:w-auto">Search</button>
+                            </form>
+                            {% if search_message %}
+                            <p class="text-xs font-medium {% if 'No' in search_message %}text-gray-500{% else %}text-blue-600{% endif %}">{{ search_message }}</p>
+                            {% endif %}
+                            {% if resolve_message %}
+                            <p class="text-xs font-medium text-green-600">{{ resolve_message }}</p>
+                            {% endif %}
+                        </section>
                         {% endif %}
                     </div>
-                </div>
-
-                <div class="bg-white rounded-2xl shadow-md p-6 hover:shadow-lg transition md:col-span-2">
-                    <h3 class="text-xl font-semibold mb-4">Add Student</h3>
-                    <form action="/students/add" method="post" class="grid gap-4 md:grid-cols-2" autocomplete="off">
-                        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-                        <input type="text" name="student_name" placeholder="Full Name" required autocomplete="off"
-                            class="px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-500 focus:outline-none md:col-span-2">
-                        <input type="email" name="student_email" placeholder="Email" required autocomplete="off"
-                            class="px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-500 focus:outline-none md:col-span-1">
-                        <input type="text" name="student_phone" placeholder="Phone" autocomplete="off"
-                            class="px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-500 focus:outline-none md:col-span-1">
-                        <button type="submit"
-                            class="md:col-span-2 bg-indigo-600 text-white font-medium py-2 px-4 rounded-lg hover:bg-indigo-700 transition">
-                            Save Student
-                        </button>
-                        {% if student_message %}
-                            <p class="md:col-span-2 text-sm text-center {% if student_error %}text-red-500{% else %}text-green-600{% endif %}">
-                                {{ student_message }}
-                            </p>
+                    {% if session.get('role') == 'admin_role' %}
+                    <section class="rounded-2xl bg-white p-6 shadow space-y-4">
+                        <div class="flex flex-wrap items-center justify-between gap-2">
+                            <div>
+                                <h3 class="text-lg font-semibold">Manage Tickets</h3>
+                                <span class="text-xs font-medium text-gray-500">{% if show_resolved %}Currently viewing resolved tickets{% else %}Currently viewing open tickets{% endif %}</span>
+                            </div>
+                            <div class="flex flex-wrap gap-2">
+                                <a href="{{ url_for('view_all_tickets') }}" class="rounded-full px-3 py-1 text-xs font-semibold {% if not show_resolved %}bg-blue-600 text-white{% else %}bg-gray-200 text-gray-700{% endif %}">Open</a>
+                                <a href="{{ url_for('view_all_tickets', show_resolved='true') }}" class="rounded-full px-3 py-1 text-xs font-semibold {% if show_resolved %}bg-purple-600 text-white{% else %}bg-gray-200 text-gray-700{% endif %}">Resolved</a>
+                            </div>
+                        </div>
+                        {% if manage_message %}
+                        <p class="text-xs font-medium {% if manage_error %}text-red-500{% else %}text-blue-600{% endif %}">{{ manage_message }}</p>
                         {% endif %}
-                    </form>
-                </div>
-            </section>
-        {% endif %}
+                        <div class="space-y-3">
+                            {% if results %}
+                            {% for ticket in results %}
+                            <div class="rounded-xl border border-gray-200 bg-gray-50 p-4 text-sm">
+                                <div class="flex flex-col gap-2 md:flex-row md:items-center md:justify-between">
+                                    <div>
+                                        <span class="font-semibold text-gray-900">Ticket #{{ ticket[0] }}</span>
+                                        <span class="ml-2 text-gray-600">{{ ticket[1] }}</span>
+                                    </div>
+                                    <div class="flex flex-wrap items-center gap-2">
+                                        {% if not show_resolved %}
+                                        <form action="/resolve_ticket" method="post" class="inline">
+                                            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                                            <input type="hidden" name="ticket_id" value="{{ ticket[0] }}">
+                                            <button type="submit"
+                                                class="rounded-full bg-green-500 px-3 py-1 text-xs font-semibold text-white hover:bg-green-600 transition">Resolve</button>
+                                        </form>
+                                        {% endif %}
+                                        <form action="/tickets/edit" method="post" class="flex items-center gap-2" autocomplete="off">
+                                            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                                            <input type="hidden" name="ticket_id" value="{{ ticket[0] }}">
+                                            <input type="hidden" name="source" value="{% if show_resolved %}resolved{% else %}active{% endif %}">
+                                            <input type="text" name="issue" value="{{ ticket[1]|e }}"
+                                                class="w-56 rounded-lg border border-gray-300 px-2 py-1 text-xs focus:ring-2 focus:ring-blue-500 focus:outline-none" autocomplete="off">
+                                            <button type="submit"
+                                                class="rounded-full bg-blue-500 px-3 py-1 text-xs font-semibold text-white hover:bg-blue-600 transition">Update</button>
+                                        </form>
+                                        <form action="/tickets/delete" method="post" class="inline" onsubmit="return confirm('Delete this ticket?');">
+                                            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                                            <input type="hidden" name="ticket_id" value="{{ ticket[0] }}">
+                                            <input type="hidden" name="source" value="{% if show_resolved %}resolved{% else %}active{% endif %}">
+                                            <button type="submit"
+                                                class="rounded-full bg-red-500 px-3 py-1 text-xs font-semibold text-white hover:bg-red-600 transition">Delete</button>
+                                        </form>
+                                    </div>
+                                </div>
+                            </div>
+                            {% endfor %}
+                            {% else %}
+                            <p class="text-xs text-gray-500">No tickets found for the selected filter.</p>
+                            {% endif %}
+                        </div>
+                    </section>
+                    {% endif %}
+                    {% endif %}
 
-        {% if extra_content %}
-            <section class="bg-white rounded-2xl shadow-md p-6">
-                {{ extra_content|safe }}
-            </section>
-        {% endif %}
+                    {% if active_page == 'students' %}
+                    <section class="rounded-2xl bg-white p-6 shadow space-y-4">
+                        <h3 class="text-lg font-semibold">{{ page_title or 'Student Directory' }}</h3>
+                        <p class="text-sm text-gray-500">{{ page_description or 'View student contact information available to support staff.' }}</p>
+                        {% if student_rows %}
+                        <div class="overflow-x-auto">
+                            <table class="min-w-full text-sm border">
+                                <thead>
+                                    <tr class="bg-gray-100 text-left">
+                                        <th class="border px-3 py-2 font-semibold">ID</th>
+                                        <th class="border px-3 py-2 font-semibold">Name</th>
+                                        <th class="border px-3 py-2 font-semibold">Email</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    {% for s in student_rows %}
+                                    <tr class="odd:bg-white even:bg-gray-50">
+                                        <td class="border px-3 py-2">{{ s[0] }}</td>
+                                        <td class="border px-3 py-2">{{ s[1] }}</td>
+                                        <td class="border px-3 py-2">{{ s[2] }}</td>
+                                    </tr>
+                                    {% endfor %}
+                                </tbody>
+                            </table>
+                        </div>
+                        {% else %}
+                        <p class="text-xs text-gray-500">No students found.</p>
+                        {% endif %}
+                    </section>
+                    {% endif %}
+
+                    {% if active_page == 'sensitive' %}
+                    <div class="grid gap-6 lg:grid-cols-3">
+                        <section class="rounded-2xl bg-white p-6 shadow space-y-4">
+                            <h3 class="text-lg font-semibold">Add Student Record</h3>
+                            <p class="text-sm text-gray-500">Capture the latest student contact details. Phone numbers remain restricted to administrators.</p>
+                            <form action="/students/add" method="post" class="space-y-3" autocomplete="off">
+                                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                                <input type="text" name="student_name" placeholder="Full Name" required autocomplete="off"
+                                    class="w-full rounded-lg border border-gray-300 px-3 py-2 focus:ring-2 focus:ring-indigo-500 focus:outline-none">
+                                <input type="email" name="student_email" placeholder="Email" required autocomplete="off"
+                                    class="w-full rounded-lg border border-gray-300 px-3 py-2 focus:ring-2 focus:ring-indigo-500 focus:outline-none">
+                                <input type="text" name="student_phone" placeholder="Phone"
+                                    class="w-full rounded-lg border border-gray-300 px-3 py-2 focus:ring-2 focus:ring-indigo-500 focus:outline-none">
+                                <button type="submit"
+                                    class="w-full rounded-lg bg-indigo-600 py-2 text-sm font-semibold text-white hover:bg-indigo-700 transition">Save Student</button>
+                            </form>
+                            {% if student_message %}
+                            <p class="text-xs font-medium text-center {% if student_error %}text-red-500{% else %}text-green-600{% endif %}">{{ student_message }}</p>
+                            {% endif %}
+                        </section>
+                        
+                        <section class="rounded-2xl bg-white p-6 shadow space-y-4">
+                            <h3 class="text-lg font-semibold">Edit Student Record</h3>
+                            <p class="text-sm text-gray-500">Update existing student information. Select a student by ID to modify their details.</p>
+                            <form action="/students/edit" method="post" class="space-y-3" autocomplete="off">
+                                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                                <input type="number" name="student_id" placeholder="Student ID" required autocomplete="off"
+                                    class="w-full rounded-lg border border-gray-300 px-3 py-2 focus:ring-2 focus:ring-amber-500 focus:outline-none">
+                                <input type="text" name="student_name" placeholder="Full Name" autocomplete="off"
+                                    class="w-full rounded-lg border border-gray-300 px-3 py-2 focus:ring-2 focus:ring-amber-500 focus:outline-none">
+                                <input type="email" name="student_email" placeholder="Email" autocomplete="off"
+                                    class="w-full rounded-lg border border-gray-300 px-3 py-2 focus:ring-2 focus:ring-amber-500 focus:outline-none">
+                                <input type="text" name="student_phone" placeholder="Phone"
+                                    class="w-full rounded-lg border border-gray-300 px-3 py-2 focus:ring-2 focus:ring-amber-500 focus:outline-none">
+                                <button type="submit"
+                                    class="w-full rounded-lg bg-amber-600 py-2 text-sm font-semibold text-white hover:bg-amber-700 transition">Update Student</button>
+                            </form>
+                            <p class="text-xs text-gray-400 italic text-center">Backend handler: /students/edit (To be implemented)</p>
+                        </section>
+                        
+                        <section class="rounded-2xl bg-white p-6 shadow">
+                            <h3 class="text-lg font-semibold">Data Handling Notes</h3>
+                            <ul class="mt-3 space-y-2 text-sm text-gray-600">
+                                <li>• Verify student identity before updating contact details.</li>
+                                <li>• Never disclose phone numbers to non-admin personnel.</li>
+                                <li>• Audit logs capture all insert actions with your staff ID.</li>
+                                <li>• Edit operations will be logged for security tracking.</li>
+                            </ul>
+                        </section>
+                    </div>
+                    <section class="rounded-2xl bg-white p-6 shadow space-y-4">
+                        <h3 class="text-lg font-semibold">Full Students (Sensitive)</h3>
+                        <p class="text-sm text-gray-500">Admin-only access to phone numbers.</p>
+                        {% if full_student_rows %}
+                        <div class="overflow-x-auto">
+                            <table class="min-w-full text-sm border">
+                                <thead>
+                                    <tr class="bg-gray-100 text-left">
+                                        <th class="border px-3 py-2 font-semibold">ID</th>
+                                        <th class="border px-3 py-2 font-semibold">Name</th>
+                                        <th class="border px-3 py-2 font-semibold">Email</th>
+                                        <th class="border px-3 py-2 font-semibold">Phone</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    {% for s in full_student_rows %}
+                                    <tr class="odd:bg-white even:bg-gray-50">
+                                        <td class="border px-3 py-2">{{ s[0] }}</td>
+                                        <td class="border px-3 py-2">{{ s[1] }}</td>
+                                        <td class="border px-3 py-2">{{ s[2] }}</td>
+                                        <td class="border px-3 py-2">{{ s[3] or '' }}</td>
+                                    </tr>
+                                    {% endfor %}
+                                </tbody>
+                            </table>
+                        </div>
+                        {% else %}
+                        <p class="text-xs text-gray-500">No student records available.</p>
+                        {% endif %}
+                    </section>
+                    {% endif %}
+
+                    {% if active_page == 'accounts' %}
+                    <div class="grid gap-6 lg:grid-cols-2">
+                        <section class="rounded-2xl bg-white p-6 shadow space-y-4">
+                            <h3 class="text-lg font-semibold">Create Staff Account</h3>
+                            <p class="text-sm text-gray-500">Provision support or admin access with a temporary password. Users should change credentials on first login.</p>
+                            <form action="/accounts/create" method="post" class="space-y-3" autocomplete="off">
+                                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                                <input type="text" name="account_username" placeholder="Username" required autocomplete="off"
+                                    class="w-full rounded-lg border border-gray-300 px-3 py-2 focus:ring-2 focus:ring-gray-500 focus:outline-none">
+                                <input type="password" name="account_password" placeholder="Temporary Password" required autocomplete="off"
+                                    class="w-full rounded-lg border border-gray-300 px-3 py-2 focus:ring-2 focus:ring-gray-500 focus:outline-none">
+                                <select name="account_role" required
+                                    class="w-full rounded-lg border border-gray-300 px-3 py-2 focus:ring-2 focus:ring-gray-500 focus:outline-none">
+                                    <option value="support_role">Support Role</option>
+                                    <option value="admin_role">Admin Role</option>
+                                </select>
+                                <button type="submit"
+                                    class="w-full rounded-lg bg-gray-800 py-2 text-sm font-semibold text-white hover:bg-gray-900 transition">Create Account</button>
+                            </form>
+                            {% if account_message %}
+                            <p class="text-xs font-medium text-center {% if account_error %}text-red-500{% else %}text-green-600{% endif %}">{{ account_message }}</p>
+                            {% endif %}
+                        </section>
+                        <section class="rounded-2xl bg-white p-6 shadow">
+                            <h3 class="text-lg font-semibold">Role Guidance</h3>
+                            <ul class="mt-3 space-y-2 text-sm text-gray-600">
+                                <li>• Assign <strong>Support Role</strong> for ticket intake and triage.</li>
+                                <li>• Reserve <strong>Admin Role</strong> for student data and account management.</li>
+                                <li>• Audit entries capture every account change.</li>
+                            </ul>
+                        </section>
+                    </div>
+                    <section class="rounded-2xl bg-white p-6 shadow space-y-4">
+                        <h3 class="text-lg font-semibold">Existing Accounts</h3>
+                        <p class="text-sm text-gray-500">Review active staff credentials and their assigned roles.</p>
+                        {% if accounts %}
+                        <div class="overflow-x-auto">
+                            <table class="min-w-full text-sm border">
+                                <thead>
+                                    <tr class="bg-gray-100 text-left">
+                                        <th class="border px-3 py-2 font-semibold">ID</th>
+                                        <th class="border px-3 py-2 font-semibold">Username</th>
+                                        <th class="border px-3 py-2 font-semibold">Role</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    {% for account in accounts %}
+                                    <tr class="odd:bg-white even:bg-gray-50">
+                                        <td class="border px-3 py-2">{{ account.id }}</td>
+                                        <td class="border px-3 py-2">{{ account.username }}</td>
+                                        <td class="border px-3 py-2">{{ account.role }}</td>
+                                    </tr>
+                                    {% endfor %}
+                                </tbody>
+                            </table>
+                        </div>
+                        {% else %}
+                        <p class="text-xs text-gray-500">No staff accounts available.</p>
+                        {% endif %}
+                    </section>
+                    {% endif %}
+
+                    {% if active_page == 'audits' %}
+                    <section class="rounded-2xl bg-white p-6 shadow space-y-4">
+                        <div class="flex flex-wrap items-center justify-between gap-2">
+                            <div>
+                                <h3 class="text-lg font-semibold">Audit Log</h3>
+                                <p class="text-sm text-gray-500">Review recent administrative and ticket activities.</p>
+                            </div>
+                            <span class="text-xs font-medium text-gray-400">Latest {{ audit_entries|length }} records</span>
+                        </div>
+                        {% if audit_entries %}
+                        <div class="overflow-x-auto">
+                            <table class="min-w-full text-sm border">
+                                <thead>
+                                    <tr class="bg-gray-100 text-left">
+                                        <th class="border px-3 py-2 font-semibold">ID</th>
+                                        <th class="border px-3 py-2 font-semibold">Timestamp</th>
+                                        <th class="border px-3 py-2 font-semibold">Action</th>
+                                        <th class="border px-3 py-2 font-semibold">Staff</th>
+                                        <th class="border px-3 py-2 font-semibold">Details</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    {% for entry in audit_entries %}
+                                    <tr class="odd:bg-white even:bg-gray-50 align-top">
+                                        <td class="border px-3 py-2">{{ entry.audit_id }}</td>
+                                        <td class="border px-3 py-2 whitespace-nowrap text-xs text-gray-500">{{ entry.logged_at }}</td>
+                                        <td class="border px-3 py-2 uppercase tracking-wide text-xs font-semibold text-gray-700">{{ entry.action }}</td>
+                                        <td class="border px-3 py-2 text-xs">{{ entry.staff_id or '—' }}</td>
+                                        <td class="border px-3 py-2 text-xs">
+                                            {% if entry.new_data %}
+                                            <div>
+                                                <span class="font-semibold text-gray-600">New:</span>
+                                                <pre class="mt-1 rounded bg-gray-100 px-2 py-1 text-[11px] leading-4 whitespace-pre-wrap">{{ entry.new_data|tojson(indent=2) }}</pre>
+                                            </div>
+                                            {% endif %}
+                                            {% if entry.old_data %}
+                                            <div class="mt-2">
+                                                <span class="font-semibold text-gray-600">Old:</span>
+                                                <pre class="mt-1 rounded bg-gray-100 px-2 py-1 text-[11px] leading-4 whitespace-pre-wrap">{{ entry.old_data|tojson(indent=2) }}</pre>
+                                            </div>
+                                            {% endif %}
+                                            {% if not entry.old_data and not entry.new_data %}
+                                            <span class="text-gray-400">No data captured.</span>
+                                            {% endif %}
+                                        </td>
+                                    </tr>
+                                    {% endfor %}
+                                </tbody>
+                            </table>
+                        </div>
+                        {% else %}
+                        <p class="text-xs text-gray-500">No audit entries found.</p>
+                        {% endif %}
+                    </section>
+                    {% endif %}
+
+                    {% if extra_content and active_page not in ['tickets', 'students', 'sensitive', 'accounts', 'audits'] %}
+                    <section class="rounded-2xl bg-white p-6 shadow">
+                        {{ extra_content|safe }}
+                    </section>
+                    {% endif %}
+                </section>
+            </div>
+            {% endif %}
+        </main>
     </div>
+
+    {% if chart_configs %}
+    <script>
+        document.addEventListener('DOMContentLoaded', function () {
+            const chartConfigs = {{ chart_configs|tojson }};
+            chartConfigs.forEach(cfg => {
+                const canvas = document.getElementById(cfg.id);
+                if (!canvas) {
+                    return;
+                }
+                const ctx = canvas.getContext('2d');
+                const options = Object.assign({
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    plugins: {
+                        legend: { position: cfg.legend_position || (cfg.type === 'doughnut' ? 'bottom' : 'top') }
+                    }
+                }, cfg.options || {});
+                if (cfg.title_text) {
+                    options.plugins = options.plugins || {};
+                    options.plugins.title = {
+                        display: true,
+                        text: cfg.title_text,
+                        font: { size: 14 }
+                    };
+                }
+                if (cfg.type === 'bar') {
+                    options.scales = Object.assign({
+                        y: {
+                            beginAtZero: true,
+                            ticks: { precision: 0 }
+                        }
+                    }, options.scales || {});
+                }
+                const dataset = {
+                    label: cfg.dataset_label || '',
+                    data: cfg.data,
+                    backgroundColor: cfg.background_color || '#2563eb',
+                    borderRadius: cfg.type === 'bar' ? 8 : 0,
+                    hoverOffset: cfg.type === 'doughnut' ? 6 : 0,
+                    maxBarThickness: cfg.type === 'bar' ? 36 : undefined
+                };
+                const data = {
+                    labels: cfg.labels,
+                    datasets: [dataset]
+                };
+                new Chart(ctx, {
+                    type: cfg.type,
+                    data,
+                    options
+                });
+            });
+        });
+    </script>
+    {% endif %}
 </body>
 </html>
 """
@@ -420,8 +1030,7 @@ html_template = """
 # Routes
 @app.route('/', methods=['GET'])
 def index():
-    # CHANGE: provide default context variables
-    return render_template_string(html_template, results=None)
+    return render_template_string(html_template, **base_view_context())
 
 @app.route('/login', methods=['POST'])
 @limiter.limit("5 per minute")
@@ -431,26 +1040,36 @@ def login():
     
     # Validate input
     if not username or not password:
-        return render_template_string(html_template, login_message="Invalid credentials.", results=None)
+        return render_template_string(html_template, **base_view_context(login_message="Invalid credentials."))
     
     conn = get_db_connection()
     if not conn:
-        return render_template_string(html_template, login_message="Service temporarily unavailable.", results=None)
+        return render_template_string(html_template, **base_view_context(login_message="Service temporarily unavailable."))
     try:
         cur = conn.cursor()
-        cur.execute(
-            "SELECT id, username, role FROM staff_users WHERE username = %s AND password_hash = crypt(%s, password_hash)",
-            (username, password)
-        )
-        user = cur.fetchone()
+        
+        # Try with bcrypt first, then fall back to plain text for development
+        try:
+            cur.execute(
+                "SELECT id, username, role FROM staff_users WHERE username = %s AND password_hash = crypt(%s, password_hash)",
+                (username, password)
+            )
+            user = cur.fetchone()
+        except psycopg2.Error:
+            # Fallback to plain text password (for development databases)
+            cur.execute(
+                "SELECT id, username, role FROM staff_users WHERE username = %s AND password = %s",
+                (username, password)
+            )
+            user = cur.fetchone()
+        
         cur.close()
         if user:
             normalized_role = normalize_role(user[2])
             if not normalized_role:
                 return render_template_string(
                     html_template,
-                    login_message="Account role is not authorized. Contact the administrator.",
-                    results=None
+                    **base_view_context(login_message="Account role is not authorized. Contact the administrator.")
                 )
             session.permanent = False  # Do not keep the session once the browser closes
             session['logged_in'] = True
@@ -461,11 +1080,11 @@ def login():
             # Don't redirect, just reload with session
             return redirect(url_for('index'))
         # Use generic message to prevent username enumeration
-        return render_template_string(html_template, login_message="Invalid credentials.", results=None)
+        return render_template_string(html_template, **base_view_context(login_message="Invalid credentials."))
     except (Exception, psycopg2.Error) as error:
         print(f"Login error: {error}")  # Log server-side only
         # Generic error message to prevent information disclosure
-        return render_template_string(html_template, login_message="An error occurred. Please try again.", results=None)
+        return render_template_string(html_template, **base_view_context(login_message="An error occurred. Please try again."))
     finally:
         if conn:
             conn.close()
@@ -483,9 +1102,10 @@ def handle_rate_limit(e):
 def handle_server_error(e):
     """Handle 500 errors without revealing server details"""
     print(f"Internal server error: {e}")  # Log server-side
-    return render_template_string(html_template, 
-                                 login_message="An internal error occurred. Please try again later.",
-                                 results=None), 500
+    return render_template_string(
+        html_template,
+        **base_view_context(login_message="An internal error occurred. Please try again later.")
+    ), 500
 
 @app.errorhandler(404)
 def handle_not_found(e):
@@ -495,9 +1115,10 @@ def handle_not_found(e):
 @app.errorhandler(403)
 def handle_forbidden(e):
     """Handle 403 errors"""
-    return render_template_string(html_template,
-                                 login_message="Access forbidden.",
-                                 results=None), 403
+    return render_template_string(
+        html_template,
+        **base_view_context(access_message="Access forbidden.")
+    ), 403
 
 @app.route('/logout')
 @login_required
@@ -509,28 +1130,27 @@ def logout():
 @app.route('/students')
 @login_required
 def students_restricted():
-    if session.get('role') not in ('support_role', 'admin_role'):
+    role = session.get('role')
+    if role not in ('support_role', 'admin_role'):
         return render_template_string(
             html_template,
-            results=None,
-            access_message="Access denied: support or admin role required."
+            **base_view_context(
+                access_message="Access denied: support or admin role required.",
+                active_page='students'
+            )
         )
-    conn = get_db_connection()
-    rows = []
-    try:
-        cur = conn.cursor()
-        cur.execute("SELECT id, name, email FROM v_students_support;")
-        rows = cur.fetchall()
-        cur.close()
-    finally:
-        if conn:
-            conn.close()
-    html = "<h2 class='text-xl font-semibold mb-4'>Students Directory (Restricted View)</h2>"
-    html += "<table class='w-full text-sm border'><tr><th class='border px-2'>ID</th><th class='border px-2'>Name</th><th class='border px-2'>Email</th></tr>"
-    for r in rows:
-        html += f"<tr><td class='border px-2'>{r[0]}</td><td class='border px-2'>{r[1]}</td><td class='border px-2'>{r[2]}</td></tr>"
-    html += "</table><p class='mt-4 text-gray-500 text-xs'>Phone hidden (Least Privilege).</p>"
-    return render_template_string(html_template, extra_content=html, results=None)
+    if role == 'admin_role':
+        return redirect(url_for('students_full'))
+    rows = load_restricted_students()
+    return render_template_string(
+        html_template,
+        **base_view_context(
+            active_page='students',
+            page_title='Student Directory',
+            page_description='Support-safe directory showing student email access only.',
+            student_rows=rows
+        )
+    )
 
 # RBAC: full student data (admin only)
 @app.route('/students/full')
@@ -539,44 +1159,28 @@ def students_full():
     if session.get('role') != 'admin_role':
         return render_template_string(
             html_template,
-            results=None,
-            access_message="Access denied: admin only."
+            **base_view_context(
+                access_message="Access denied: admin only.",
+                active_page='sensitive'
+            )
         )
-    conn = get_db_connection()
-    rows = []
-    try:
-        cur = conn.cursor()
-        cur.execute("SELECT id, name, email, phone FROM students ORDER BY id;")
-        rows = cur.fetchall()
-        cur.close()
-    finally:
-        if conn:
-            conn.close()
-    html = "<h2 class='text-xl font-semibold mb-4 text-red-700'>Full Students (Sensitive)</h2>"
-    html += "<table class='w-full text-sm border'><tr><th class='border px-2'>ID</th><th class='border px-2'>Name</th><th class='border px-2'>Email</th><th class='border px-2'>Phone</th></tr>"
-    for r in rows:
-        html += f"<tr><td class='border px-2'>{r[0]}</td><td class='border px-2'>{r[1]}</td><td class='border px-2'>{r[2]}</td><td class='border px-2'>{r[3] or ''}</td></tr>"
-    html += "</table><p class='mt-4 text-gray-500 text-xs'>Admin-only access to phone numbers.</p>"
-    return render_template_string(html_template, extra_content=html, results=None)
+    return render_template_string(html_template, **sensitive_students_context())
 
 @app.route('/students/add', methods=['POST'])
 @login_required
 def add_student():
-    """Allow support and admin members to add student records."""
-    if session.get('role') not in ('support_role', 'admin_role'):
+    """Allow administrators to add student records."""
+    if session.get('role') != 'admin_role':
         return render_template_string(
             html_template,
-            results=None,
-            access_message="Access denied: support or admin role required."
+            **base_view_context(
+                access_message="Access denied: admin only.",
+                active_page='sensitive'
+            )
         )
 
     def render_student_feedback(message, is_error=False):
-        return render_template_string(
-            html_template,
-            student_message=message,
-            student_error=is_error,
-            results=None
-        )
+        return render_template_string(html_template, **sensitive_students_context(message, is_error))
 
     name = request.form.get('student_name', '').strip()
     email = request.form.get('student_email', '').strip()
@@ -626,10 +1230,9 @@ def add_student():
             "phone": sanitized_phone or None
         }
         staff_id = int(user_id) if user_id is not None else None
-        audit_ticket_id = -new_id  # negative id = non-ticket event while keeping column non-null
         cur.execute(
-            "INSERT INTO audit_log_ticket (ticket_id, staff_id, action, old_data, new_data) VALUES (%s, %s, %s, %s, %s)",
-            (audit_ticket_id, staff_id, 'STUDENT_INSERT', None, Json(audit_payload))
+            "INSERT INTO audit_log (staff_id, action, old_data, new_data) VALUES (%s, %s, %s, %s)",
+            (staff_id, 'STUDENT_INSERT', None, Json(audit_payload))
         )
 
         conn.commit()
@@ -648,81 +1251,198 @@ def add_student():
             conn.close()
 
 
+@app.route('/accounts', methods=['GET'])
+@login_required
+def accounts_admin():
+    if session.get('role') != 'admin_role':
+        return render_template_string(
+            html_template,
+            **base_view_context(
+                access_message="Access denied: admin only.",
+                active_page='accounts'
+            )
+        )
+    return render_template_string(html_template, **accounts_view_context())
+
+
+@app.route('/accounts/create', methods=['POST'])
+@login_required
+def create_account():
+    if session.get('role') != 'admin_role':
+        return render_template_string(
+            html_template,
+            **base_view_context(
+                access_message="Access denied: admin only.",
+                active_page='accounts'
+            )
+        )
+
+    username = request.form.get('account_username', '').strip()
+    password = request.form.get('account_password', '')
+    requested_role = request.form.get('account_role', '').strip()
+    normalized_target = normalize_role(requested_role)
+
+    def render_account_feedback(message, is_error=False):
+        return render_template_string(html_template, **accounts_view_context(message, is_error))
+
+    if not username or not password:
+        return render_account_feedback("Username and password are required.", True)
+
+    if len(username) > 128:
+        return render_account_feedback("Username is too long (max 128 characters).", True)
+
+    if normalized_target not in ('support_role', 'admin_role'):
+        return render_account_feedback("Select a valid staff role.", True)
+
+    conn = get_db_connection()
+    if not conn:
+        return render_account_feedback("Service temporarily unavailable.", True)
+
+    cur = None
+    try:
+        cur = conn.cursor()
+        set_trigger_user(cur, session.get('user_id'))
+
+        cur.execute("SELECT 1 FROM staff_users WHERE LOWER(username) = LOWER(%s)", (username,))
+        if cur.fetchone():
+            cur.close()
+            cur = None
+            return render_account_feedback("Username already exists.", True)
+
+        # Try bcrypt first, fallback to plain text for development databases
+        try:
+            cur.execute(
+                """
+                INSERT INTO staff_users (username, password_hash, role)
+                VALUES (%s, crypt(%s, gen_salt('bf')), %s)
+                RETURNING id
+                """,
+                (username, password, normalized_target)
+            )
+            new_user_id = cur.fetchone()[0]
+        except psycopg2.Error:
+            # Fallback to plain text password column
+            cur.execute(
+                """
+                INSERT INTO staff_users (username, password, role)
+                VALUES (%s, %s, %s)
+                RETURNING id
+                """,
+                (username, password, normalized_target)
+            )
+            new_user_id = cur.fetchone()[0]
+
+        audit_payload = {
+            "created_user_id": new_user_id,
+            "username": username,
+            "role": normalized_target
+        }
+        staff_id = session.get('user_id')
+        staff_value = int(staff_id) if staff_id is not None else None
+        cur.execute(
+            "INSERT INTO audit_log (staff_id, action, old_data, new_data) VALUES (%s, %s, %s, %s)",
+            (staff_value, 'ACCOUNT_CREATE', None, Json(audit_payload))
+        )
+
+        conn.commit()
+        cur.close()
+        cur = None
+        return render_account_feedback("Account created successfully.")
+    except psycopg2.IntegrityError as error:
+        if conn:
+            conn.rollback()
+        print(f"Account creation integrity error: {error}")
+        return render_account_feedback("Unable to create account due to constraints.", True)
+    except (Exception, psycopg2.Error) as error:
+        if conn:
+            conn.rollback()
+        print(f"Account creation error: {error}")
+        return render_account_feedback("An error occurred while creating the account.", True)
+    finally:
+        if cur:
+            cur.close()
+        if conn:
+            conn.close()
+
+
+@app.route('/audit-log', methods=['GET'])
+@login_required
+def audit_log_view():
+    if session.get('role') != 'admin_role':
+        return render_template_string(
+            html_template,
+            **base_view_context(
+                access_message="Access denied: admin only.",
+                active_page='audits'
+            )
+        )
+    return render_template_string(html_template, **audit_view_context())
+
+
 @app.route('/submit_ticket', methods=['POST'])
 @login_required  # CHANGE: enforce authentication for ticket creation
 def submit_ticket():
+    if session.get('role') not in ('support_role', 'admin_role'):
+        return render_ticket_page(access_message="Access denied: support or admin role required.")
+
     student_id = request.form.get('student_id', '').strip()
     issue = request.form.get('issue', '').strip()
-    
+
     # Validate inputs
     if not student_id or not issue:
-        return render_template_string(html_template, ticket_message="All fields are required.", results=None)
-    
+        return render_ticket_page(ticket_message="All fields are required.")
+
     # Validate student_id is numeric
     try:
         student_id = int(student_id)
     except ValueError:
-        return render_template_string(html_template, ticket_message="Invalid student ID format.", results=None)
-    
+        return render_ticket_page(ticket_message="Invalid student ID format.")
+
     # Validate issue length (prevent extremely long submissions)
     if len(issue) > 1000:
-        return render_template_string(html_template, ticket_message="Issue description is too long (max 1000 characters).", results=None)
-    
+        return render_ticket_page(ticket_message="Issue description is too long (max 1000 characters).")
+
     conn = get_db_connection()
     if not conn:
-        return render_template_string(html_template, ticket_message="Service temporarily unavailable.", results=None)
+        return render_ticket_page(ticket_message="Service temporarily unavailable.")
+    
+    cur = None
     try:
         cur = conn.cursor()
-        
-        # PHASE 3: Set session variable for auditing trigger
+
+        # Set the session variable for audit trigger to know who created the ticket
         user_id = session.get('user_id')
-        set_trigger_user(cur, user_id)
-        
-        # PHASE 3: To identify who made the change.
+        if user_id:
+            set_trigger_user(cur, user_id)
+
+        # Insert ticket (trigger will automatically create audit log entry)
         cur.execute("INSERT INTO tickets (student_id, issue) VALUES (%s, %s) RETURNING id", (student_id, issue))
         ticket_row = cur.fetchone()
         ticket_id = ticket_row[0] if ticket_row else None
-        if ticket_id is None:
-            cur.execute("SELECT currval('tickets_id_seq')")
-            ticket_id = cur.fetchone()[0]
-
-        audit_payload = {
-            "ticket_id": ticket_id,
-            "student_id": student_id,
-            "issue": issue
-        }
-        staff_id = int(user_id) if user_id is not None else None
-
-        # Reuse the row inserted by the ticket trigger so we only keep a single audit record
-        cur.execute(
-            """
-            UPDATE audit_log_ticket
-               SET action = %s,
-                   staff_id = COALESCE(%s, staff_id),
-                   old_data = NULL,
-                   new_data = %s
-             WHERE ticket_id = %s AND action = 'INSERT'
-            """,
-            ('TICKET_CREATE', staff_id, Json(audit_payload), ticket_id)
-        )
-        if cur.rowcount == 0:
-            cur.execute(
-                "INSERT INTO audit_log_ticket (ticket_id, staff_id, action, old_data, new_data) VALUES (%s, %s, %s, %s, %s)",
-                (ticket_id, staff_id, 'TICKET_CREATE', None, Json(audit_payload))
-            )
 
         conn.commit()
-        cur.close()
-        return render_template_string(html_template, ticket_message="Ticket submitted successfully!", results=None)
+        return render_ticket_page(ticket_message="Ticket submitted successfully!")
     except psycopg2.IntegrityError as error:
-        print(f"Ticket submission integrity error: {error}")
-        # Don't reveal if student exists or not (prevents enumeration)
-        return render_template_string(html_template, ticket_message="Unable to submit ticket. Please verify student ID.", results=None)
+        if conn:
+            conn.rollback()
+        error_detail = str(error)
+        print(f"Ticket submission integrity error: {error_detail}")
+        
+        # Check if it's a foreign key constraint on student_id
+        if 'student_id' in error_detail or 'foreign key' in error_detail.lower():
+            return render_ticket_page(ticket_message=f"Student ID {student_id} does not exist. Please check the ID.")
+        else:
+            return render_ticket_page(ticket_message="Unable to submit ticket. Please verify student ID.")
     except (Exception, psycopg2.Error) as error:
-        print(f"Ticket submission error: {error}")
-        # Generic error message
-        return render_template_string(html_template, ticket_message="An error occurred. Please try again.", results=None)
+        if conn:
+            conn.rollback()
+        error_detail = str(error)
+        print(f"Ticket submission error: {error_detail}")
+        # Show more specific error in development
+        return render_ticket_page(ticket_message=f"Error: {error_detail}")
     finally:
+        if cur:
+            cur.close()
         if conn:
             conn.close()
 
@@ -731,34 +1451,32 @@ def submit_ticket():
 def search_tickets():
     # CHANGE: RBAC enforcement - only admin_role may search
     if session.get('role') != 'admin_role':
-        return render_template_string(
-            html_template,
-            results=None,
-            access_message="Access denied: admin only."
-        )
+        return render_ticket_page(access_message="Access denied: admin only.")
     
     query = request.args.get('q', '').strip()
     show_resolved = request.args.get('show_resolved', 'false') == 'true'
     
-    # For "Resolved Tickets" button - allow showing all without query
-    if show_resolved:
-        results = find_tickets(query, show_resolved)
-        return render_template_string(html_template, results=results, show_resolved=show_resolved)
+    # Get tickets based on status filter (resolved or open)
+    # If query is empty, show all tickets of selected status
+    # If query is provided, filter by keyword within selected status
+    results = find_tickets(query, show_resolved)
     
-    # For regular "Search" button - use original logic (requires query)
-    results = find_tickets(query, show_resolved) if query else []
-    return render_template_string(html_template, results=results, show_resolved=show_resolved)
+    # Set appropriate message when showing all tickets
+    search_message = None
+    if not query:
+        if show_resolved:
+            search_message = "Showing all resolved tickets." if results else "No resolved tickets found."
+        else:
+            search_message = "Showing all open tickets." if results else "No open tickets found."
+    
+    return render_ticket_page(results=results, show_resolved=show_resolved, search_message=search_message)
 
 @app.route('/resolve_ticket', methods=['POST'])
 @login_required
 def resolve_ticket():
     # Only admin can mark tickets as resolved
     if session.get('role') != 'admin_role':
-        return render_template_string(
-            html_template,
-            results=None,
-            access_message="Access denied: admin only."
-        )
+        return render_ticket_page(access_message="Access denied: admin only.")
     
     ticket_id = request.form.get('ticket_id')
     admin_username = session.get('username')
@@ -768,36 +1486,20 @@ def resolve_ticket():
     try:
         ticket_id = int(ticket_id)
     except (ValueError, TypeError):
-        return render_template_string(
-            html_template,
-            results=None,
-            search_message="Invalid ticket ID."
-        )
+        return render_ticket_page(search_message="Invalid ticket ID.")
     
     success, message = mark_ticket_as_resolved(ticket_id, admin_username, user_id)
     
     if success:
-        return render_template_string(
-            html_template,
-            results=None,
-            resolve_message=message
-        )
+        return render_ticket_page(resolve_message=message)
     else:
-        return render_template_string(
-            html_template,
-            results=None,
-            search_message=message
-        )
+        return render_ticket_page(search_message=message)
 
 @app.route('/tickets/edit', methods=['POST'])
 @login_required
 def edit_ticket():
     if session.get('role') != 'admin_role':
-        return render_template_string(
-            html_template,
-            results=None,
-            access_message="Access denied: admin only."
-        )
+        return render_ticket_page(access_message="Access denied: admin only.")
 
     source = request.form.get('source', 'active')
     show_resolved = source == 'resolved'
@@ -808,8 +1510,7 @@ def edit_ticket():
         ticket_id = int(ticket_id_raw)
     except (TypeError, ValueError):
         results = find_tickets('', show_resolved)
-        return render_template_string(
-            html_template,
+        return render_ticket_page(
             results=results,
             show_resolved=show_resolved,
             manage_message="Invalid ticket ID.",
@@ -818,8 +1519,7 @@ def edit_ticket():
 
     if not updated_issue:
         results = find_tickets('', show_resolved)
-        return render_template_string(
-            html_template,
+        return render_ticket_page(
             results=results,
             show_resolved=show_resolved,
             manage_message="Issue description is required.",
@@ -828,8 +1528,7 @@ def edit_ticket():
 
     if len(updated_issue) > 1000:
         results = find_tickets('', show_resolved)
-        return render_template_string(
-            html_template,
+        return render_ticket_page(
             results=results,
             show_resolved=show_resolved,
             manage_message="Issue description is too long (max 1000 characters).",
@@ -838,9 +1537,7 @@ def edit_ticket():
 
     conn = get_db_connection()
     if not conn:
-        return render_template_string(
-            html_template,
-            results=None,
+        return render_ticket_page(
             show_resolved=show_resolved,
             manage_message="Service temporarily unavailable.",
             manage_error=True
@@ -873,26 +1570,28 @@ def edit_ticket():
                 "student_id": student_id,
                 "issue": updated_issue
             }
+            ticket_id_text = str(ticket_id)
             cur.execute(
                 """
-                UPDATE audit_log_ticket
+                UPDATE audit_log
                    SET action = %s,
                        staff_id = COALESCE(%s, staff_id),
                        old_data = %s,
                        new_data = %s
                  WHERE audit_id = (
-                        SELECT audit_id FROM audit_log_ticket
-                         WHERE ticket_id = %s AND action = 'UPDATE'
+                        SELECT audit_id FROM audit_log
+                         WHERE action = 'UPDATE'
+                           AND COALESCE(new_data->>'ticket_id', old_data->>'ticket_id') = %s
                          ORDER BY logged_at DESC
                          LIMIT 1
                     )
                 """,
-                ('TICKET_EDIT', staff_value, Json(old_data), Json(new_data), ticket_id)
+                ('TICKET_EDIT', staff_value, Json(old_data), Json(new_data), ticket_id_text)
             )
             if cur.rowcount == 0:
                 cur.execute(
-                    "INSERT INTO audit_log_ticket (ticket_id, staff_id, action, old_data, new_data) VALUES (%s, %s, %s, %s, %s)",
-                    (ticket_id, staff_value, 'TICKET_EDIT', Json(old_data), Json(new_data))
+                    "INSERT INTO audit_log (staff_id, action, old_data, new_data) VALUES (%s, %s, %s, %s)",
+                    (staff_value, 'TICKET_EDIT', Json(old_data), Json(new_data))
                 )
 
             conn.commit()
@@ -909,8 +1608,7 @@ def edit_ticket():
             conn.close()
 
     results = find_tickets('', show_resolved)
-    return render_template_string(
-        html_template,
+    return render_ticket_page(
         results=results,
         show_resolved=show_resolved,
         manage_message=manage_message,
@@ -921,11 +1619,7 @@ def edit_ticket():
 @login_required
 def delete_ticket():
     if session.get('role') != 'admin_role':
-        return render_template_string(
-            html_template,
-            results=None,
-            access_message="Access denied: admin only."
-        )
+        return render_ticket_page(access_message="Access denied: admin only.")
 
     source = request.form.get('source', 'active')
     show_resolved = source == 'resolved'
@@ -935,8 +1629,7 @@ def delete_ticket():
         ticket_id = int(ticket_id_raw)
     except (TypeError, ValueError):
         results = find_tickets('', show_resolved)
-        return render_template_string(
-            html_template,
+        return render_ticket_page(
             results=results,
             show_resolved=show_resolved,
             manage_message="Invalid ticket ID.",
@@ -945,9 +1638,7 @@ def delete_ticket():
 
     conn = get_db_connection()
     if not conn:
-        return render_template_string(
-            html_template,
-            results=None,
+        return render_ticket_page(
             show_resolved=show_resolved,
             manage_message="Service temporarily unavailable.",
             manage_error=True
@@ -975,26 +1666,28 @@ def delete_ticket():
                 "student_id": student_id,
                 "issue": old_issue
             }
+            ticket_id_text = str(ticket_id)
             cur.execute(
                 """
-                UPDATE audit_log_ticket
+                UPDATE audit_log
                    SET action = %s,
                        staff_id = COALESCE(%s, staff_id),
                        old_data = %s,
                        new_data = NULL
                  WHERE audit_id = (
-                        SELECT audit_id FROM audit_log_ticket
-                         WHERE ticket_id = %s AND action = 'DELETE'
+                        SELECT audit_id FROM audit_log
+                         WHERE action = 'DELETE'
+                           AND COALESCE(new_data->>'ticket_id', old_data->>'ticket_id') = %s
                          ORDER BY logged_at DESC
                          LIMIT 1
                     )
                 """,
-                ('TICKET_DELETE', staff_value, Json(old_data), ticket_id)
+                ('TICKET_DELETE', staff_value, Json(old_data), ticket_id_text)
             )
             if cur.rowcount == 0:
                 cur.execute(
-                    "INSERT INTO audit_log_ticket (ticket_id, staff_id, action, old_data, new_data) VALUES (%s, %s, %s, %s, %s)",
-                    (ticket_id, staff_value, 'TICKET_DELETE', Json(old_data), None)
+                    "INSERT INTO audit_log (staff_id, action, old_data, new_data) VALUES (%s, %s, %s, %s)",
+                    (staff_value, 'TICKET_DELETE', Json(old_data), None)
                 )
 
             conn.commit()
@@ -1011,8 +1704,7 @@ def delete_ticket():
             conn.close()
 
     results = find_tickets('', show_resolved)
-    return render_template_string(
-        html_template,
+    return render_ticket_page(
         results=results,
         show_resolved=show_resolved,
         manage_message=manage_message,
@@ -1023,31 +1715,12 @@ def delete_ticket():
 @app.route('/view_all')
 @login_required
 def view_all_tickets():
-    """View all tickets (admin only) - uses stored function"""
-    # Only allow admin to view all tickets
-    if session.get('role') != 'admin_role':
-        return render_template_string(
-            html_template,
-            results=None,
-            access_message="Access denied: admin only."
-        )
+    if session.get('role') not in ('support_role', 'admin_role'):
+        return render_ticket_page(access_message="Access denied: support or admin role required.")
 
-    conn = get_db_connection()
-    if not conn:
-        return render_template_string(html_template, results=None, search_message="Database connection failed.")
-
-    try:
-        cur = conn.cursor()
-        cur.execute("SELECT * FROM get_all_tickets();")
-        results = cur.fetchall()
-        cur.close()
-        return render_template_string(html_template, results=results, show_resolved=False)
-    except (Exception, psycopg2.Error) as error:
-        print(f"Error loading tickets: {error}")
-        return render_template_string(html_template, results=[], search_message="An error occurred while fetching tickets.")
-    finally:
-        if conn:
-            conn.close()
+    show_resolved = request.args.get('show_resolved', 'false') == 'true'
+    results = find_tickets('', show_resolved) if session.get('role') == 'admin_role' else []
+    return render_ticket_page(results=results, show_resolved=show_resolved)
 
 if __name__ == '__main__':
     # NOTE: Set debug=False in production to prevent information disclosure
