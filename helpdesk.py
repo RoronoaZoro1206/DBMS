@@ -119,6 +119,10 @@ def get_ticket_status_counts():
 
 def base_view_context(**overrides):
     context = {
+        "session": session,
+        "active_page": None,
+        "login_message": None,
+        "show_create": False, 
         'results': [],
         'show_resolved': False,
         'login_message': None,
@@ -482,6 +486,48 @@ def login_required(f):
         return f(*args, **kwargs)
     return wrapper
 
+# Registration Route
+@app.route('/register', methods=['GET', 'POST'])
+def register():
+    if request.method == 'GET':
+        return render_template_string(register_template)
+
+    username = request.form['username'].strip()
+    password = request.form['password']
+    confirm_password = request.form['confirm_password']
+    role = request.form['role']
+
+    if password != confirm_password:
+        return render_template_string(register_template, register_message="Passwords do not match.")
+    if len(password) < 6:
+        return render_template_string(register_template, register_message="Password must be at least 6 characters long.")
+    if not role:
+        return render_template_string(register_template, register_message="Please select a role.")
+
+
+    conn = get_db_connection()
+    if not conn:
+        return render_template_string(register_template, register_message="Database connection failed.")
+
+
+    try:
+        cur = conn.cursor()
+        cur.execute("CALL add_new_user(%s, %s, %s);", (username, password, role))
+        conn.commit()
+        cur.close()
+        return render_template_string(register_template, success=True)
+    except psycopg2.errors.UniqueViolation:
+        # Username already exists
+        conn.rollback()
+        return render_template_string(register_template, register_message="Username already exists. Please choose another.")
+    except (Exception, psycopg2.Error) as error:
+        print(f"Registration error: {error}")
+        conn.rollback()
+        return render_template_string(register_template, register_message="Error creating account. Please try again.")
+    finally:
+        if conn:
+            conn.close()
+
 # Role-aware dashboard template with sidebar and charts
 html_template = """
 <!DOCTYPE html>
@@ -536,6 +582,18 @@ html_template = """
                     </div>
                     <button type="submit"
                         class="w-full rounded-lg bg-blue-600 py-2 text-sm font-semibold text-white hover:bg-blue-700 transition">Log In</button>
+
+                    
+                    {% if show_create %}
+                        <p class="text-sm text-center mt-3">
+                        Don't have an account?
+                        <a href="{{ url_for('register') }}" class="text-blue-600 underline">Create one here</a>
+                        </p>
+                    {% endif %}
+
+                    
+
+                        
                     {% if login_message %}
                     <p class="text-center text-xs font-medium text-red-500">{{ login_message }}</p>
                     {% endif %}
@@ -668,62 +726,150 @@ html_template = """
                     </div>
                     {% if session.get('role') == 'admin_role' %}
                     <section class="rounded-2xl bg-white p-6 shadow space-y-4">
-                        <div class="flex flex-wrap items-center justify-between gap-2">
-                            <div>
-                                <h3 class="text-lg font-semibold">Manage Tickets</h3>
-                                <span class="text-xs font-medium text-gray-500">{% if show_resolved %}Currently viewing resolved tickets{% else %}Currently viewing open tickets{% endif %}</span>
-                            </div>
-                            <div class="flex flex-wrap gap-2">
-                                <a href="{{ url_for('view_all_tickets') }}" class="rounded-full px-3 py-1 text-xs font-semibold {% if not show_resolved %}bg-blue-600 text-white{% else %}bg-gray-200 text-gray-700{% endif %}">Open</a>
-                                <a href="{{ url_for('view_all_tickets', show_resolved='true') }}" class="rounded-full px-3 py-1 text-xs font-semibold {% if show_resolved %}bg-purple-600 text-white{% else %}bg-gray-200 text-gray-700{% endif %}">Resolved</a>
-                            </div>
-                        </div>
+                        <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 border-b pb-3">
+                    <div>
+                        <h3 class="text-lg font-semibold text-gray-800">Manage Tickets</h3>
+                        <span class="text-xs font-medium text-gray-500 block mt-1">
+                        {% if show_resolved %}
+                            Currently viewing resolved tickets
+                        {% else %}
+                            Currently viewing open tickets
+                        {% endif %}
+                        </span>
+                    </div>
+
+                    <div class="flex items-center gap-2">
+                        <a href="{{ url_for('view_all_tickets') }}"
+                        class="rounded-full px-4 py-1.5 text-xs font-semibold transition
+                                {% if not show_resolved %}
+                                    bg-blue-600 text-white hover:bg-blue-700
+                                {% else %}
+                                    bg-gray-200 text-gray-700 hover:bg-gray-300
+                                {% endif %}">
+                        Open
+                        </a>
+
+                        <a href="{{ url_for('view_all_tickets', show_resolved='true') }}"
+                        class="rounded-full px-4 py-1.5 text-xs font-semibold transition
+                                {% if show_resolved %}
+                                    bg-purple-600 text-white hover:bg-purple-700
+                                {% else %}
+                                    bg-gray-200 text-gray-700 hover:bg-gray-300
+                                {% endif %}">
+                        Resolved
+                        </a>
+                    </div>
+                    </div>
+
                         {% if manage_message %}
                         <p class="text-xs font-medium {% if manage_error %}text-red-500{% else %}text-blue-600{% endif %}">{{ manage_message }}</p>
                         {% endif %}
                         <div class="space-y-3">
                             {% if results %}
                             {% for ticket in results %}
-                            <div class="rounded-xl border border-gray-200 bg-gray-50 p-4 text-sm">
-                                <div class="flex flex-col gap-2 md:flex-row md:items-center md:justify-between">
-                                    <div>
-                                        <span class="font-semibold text-gray-900">Ticket #{{ ticket[0] }}</span>
-                                        <span class="ml-2 text-gray-600">{{ ticket[1] }}</span>
-                                    </div>
-                                    <div class="flex flex-wrap items-center gap-2">
-                                        {% if not show_resolved %}
-                                        <form action="/resolve_ticket" method="post" class="inline">
-                                            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-                                            <input type="hidden" name="ticket_id" value="{{ ticket[0] }}">
-                                            <button type="submit"
-                                                class="rounded-full bg-green-500 px-3 py-1 text-xs font-semibold text-white hover:bg-green-600 transition">Resolve</button>
-                                        </form>
-                                        {% endif %}
-                                        <form action="/tickets/edit" method="post" class="flex items-center gap-2" autocomplete="off">
-                                            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-                                            <input type="hidden" name="ticket_id" value="{{ ticket[0] }}">
-                                            <input type="hidden" name="source" value="{% if show_resolved %}resolved{% else %}active{% endif %}">
-                                            <input type="text" name="issue" value="{{ ticket[1]|e }}"
-                                                class="w-56 rounded-lg border border-gray-300 px-2 py-1 text-xs focus:ring-2 focus:ring-blue-500 focus:outline-none" autocomplete="off">
-                                            <button type="submit"
-                                                class="rounded-full bg-blue-500 px-3 py-1 text-xs font-semibold text-white hover:bg-blue-600 transition">Update</button>
-                                        </form>
-                                        <form action="/tickets/delete" method="post" class="inline" onsubmit="return confirm('Delete this ticket?');">
-                                            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-                                            <input type="hidden" name="ticket_id" value="{{ ticket[0] }}">
-                                            <input type="hidden" name="source" value="{% if show_resolved %}resolved{% else %}active{% endif %}">
-                                            <button type="submit"
-                                                class="rounded-full bg-red-500 px-3 py-1 text-xs font-semibold text-white hover:bg-red-600 transition">Delete</button>
-                                        </form>
-                                    </div>
-                                </div>
+                            <div class="grid grid-cols-1 md:grid-cols-5 gap-3 items-center rounded-xl border border-gray-200 bg-gray-50 p-4 text-sm">
+                            
+                            <div class="font-semibold text-gray-900 whitespace-nowrap">
+                                Ticket #{{ ticket[0] }}
+                            </div>
+
+                            <div class="text-gray-700 break-words">
+                                {{ ticket[1] }}
+                            </div>
+
+                            <div class="text-center">
+                                {% if not show_resolved %}
+                                <form action="/resolve_ticket" method="post" class="inline">
+                                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                                <input type="hidden" name="ticket_id" value="{{ ticket[0] }}">
+                                <button type="submit"
+                                    class="rounded-full bg-green-500 px-3 py-1 text-xs font-semibold text-white hover:bg-green-600 transition">
+                                    Resolve
+                                </button>
+                                </form>
+                                {% else %}
+                                <span class="text-xs text-gray-500 italic">Resolved</span>
+                                {% endif %}
+                            </div>
+
+                            <div class="md:col-span-1">
+                                <form action="/tickets/edit" method="post" class="flex gap-2 items-center" autocomplete="off">
+                                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                                <input type="hidden" name="ticket_id" value="{{ ticket[0] }}">
+                                <input type="hidden" name="source" value="{% if show_resolved %}resolved{% else %}active{% endif %}">
+                                <input type="text" name="issue" value="{{ ticket[1]|e }}"
+                                    class="flex-1 rounded-lg border border-gray-300 px-2 py-1 text-xs focus:ring-2 focus:ring-blue-500 focus:outline-none"
+                                    autocomplete="off">
+                                <button type="submit"
+                                    class="rounded-full bg-blue-500 px-3 py-1 text-xs font-semibold text-white hover:bg-blue-600 transition">
+                                    Update
+                                </button>
+                                </form>
+                            </div>
+
+                            <div class="text-right">
+                                <form action="/tickets/delete" method="post" class="inline" onsubmit="return confirm('Delete this ticket?');">
+                                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                                <input type="hidden" name="ticket_id" value="{{ ticket[0] }}">
+                                <input type="hidden" name="source" value="{% if show_resolved %}resolved{% else %}active{% endif %}">
+                                <button type="submit"
+                                    class="rounded-full bg-red-500 px-3 py-1 text-xs font-semibold text-white hover:bg-red-600 transition">
+                                    Delete
+                                </button>
+                                </form>
+                            </div>
                             </div>
                             {% endfor %}
+
                             {% else %}
                             <p class="text-xs text-gray-500">No tickets found for the selected filter.</p>
                             {% endif %}
                         </div>
                     </section>
+
+                    <!-- View All Tickets -->
+                    <section class="rounded-2xl bg-white p-6 shadow mt-6 space-y-4">
+                    <!-- View All Tickets Button -->
+                    <form action="{{ url_for('tickets_full') }}" method="get" class="text-center">
+                        <button
+                        type="submit"
+                        class="w-full rounded-2xl bg-gray-800 py-3 text-sm font-semibold text-white hover:bg-gray-900 transition">
+                        View All Tickets
+                        </button>
+                    </form>
+
+                    {% if all_tickets is defined %}
+                        {% if all_tickets %}
+                        <h3 class="text-lg font-semibold mt-6">All Tickets (Admin View)</h3>
+                        <p class="text-sm text-gray-500">Shows every ticket including resolved ones.</p>
+                        <div class="overflow-x-auto mt-6">
+                        <table class="min-w-full text-sm border">
+                            <thead>
+                            <tr class="bg-gray-100 text-left">
+                                <th class="border px-3 py-2 font-semibold">Ticket ID</th>
+                                <th class="border px-3 py-2 font-semibold">Issue</th>
+                                <th class="border px-3 py-2 font-semibold">Created At</th>
+                            </tr>
+                            </thead>
+                            <tbody>
+                            {% for t in all_tickets %}
+                            <tr class="odd:bg-white even:bg-gray-50">
+                                <td class="border px-3 py-2">{{ t[0] }}</td>
+                                <td class="border px-3 py-2">{{ t[1] }}</td>
+                                <td class="border px-3 py-2">{{ t[2].strftime("%Y-%m-%d %H:%M") }}</td>
+                            </tr>
+                            {% endfor %}
+                            </tbody>
+                        </table>
+                        </div>
+                        {% else %}
+                        <p class="text-xs text-gray-500 mt-4">No tickets found.</p>
+                        {% endif %}
+                    {% endif %}
+                    </section>
+
+
+
                     {% endif %}
                     {% endif %}
 
@@ -1027,10 +1173,87 @@ html_template = """
 </html>
 """
 
+register_template = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Create Account</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-50 font-sans text-gray-800">
+  <div class="max-w-md mx-auto p-6 mt-10 bg-white rounded-2xl shadow-md">
+    <h2 class="text-2xl font-semibold text-center mb-6">Create Account</h2>
+    <form action="/register" method="post" class="space-y-4">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+
+
+      <input type="text" name="username" placeholder="Username" required
+        class="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:outline-none">
+
+
+      <input type="password" name="password" placeholder="Password" required
+        class="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:outline-none">
+
+
+      <input type="password" name="confirm_password" placeholder="Confirm Password" required
+        class="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:outline-none">
+
+
+      <select name="role" required
+        class="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:outline-none">
+        <option value="">Select Role</option>
+        <option value="support_role">Support Role</option>
+        <option value="admin_role">Admin Role</option>
+      </select>
+
+
+      <button type="submit"
+        class="w-full bg-green-600 text-white font-medium py-2 px-4 rounded-lg hover:bg-green-700 transition">
+        Create Account
+      </button>
+
+
+      {% if register_message %}
+        <p class="text-center mt-2 text-red-500 text-sm">{{ register_message }}</p>
+      {% endif %}
+    </form>
+
+
+    {% if success %}
+      <div class="text-center mt-4">
+        <a href="{{ url_for('index') }}"
+          class="inline-block bg-blue-600 text-white px-4 py-2 rounded-lg hover:bg-blue-700 transition">
+          Proceed to Login
+        </a>
+      </div>
+    {% endif %}
+  </div>
+</body>
+</html>
+"""
+
+
 # Routes
 @app.route('/', methods=['GET'])
 def index():
     return render_template_string(html_template, **base_view_context())
+
+# admin login
+@app.route('/admin', methods=['GET'])
+def admin_login_view():
+    return render_template_string(
+        html_template,
+        **base_view_context(show_create=True)
+    )
+
+# support login
+@app.route('/support', methods=['GET'])
+def support_login_view():
+    return render_template_string(
+        html_template,
+        **base_view_context(show_create=False)
+    )
 
 @app.route('/login', methods=['POST'])
 @limiter.limit("5 per minute")
@@ -1711,7 +1934,7 @@ def delete_ticket():
         manage_error=manage_error
     )
 
-# View all tickets
+# View tickets according to filter
 @app.route('/view_all')
 @login_required
 def view_all_tickets():
@@ -1722,7 +1945,51 @@ def view_all_tickets():
     results = find_tickets('', show_resolved) if session.get('role') == 'admin_role' else []
     return render_ticket_page(results=results, show_resolved=show_resolved)
 
+
+@app.route('/tickets/full')
+@login_required
+def tickets_full():
+    if session.get('role') != 'admin_role':
+        return render_ticket_page(
+            access_message="Access denied: admin only.",
+            active_page='tickets'
+        )
+
+    conn = get_db_connection()
+    if not conn:
+        return render_ticket_page(
+            manage_message="Database unavailable.",
+            manage_error=True,
+            active_page='tickets'
+        )
+
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM get_all_tickets();")
+        all_tickets = cur.fetchall()
+        cur.close()
+
+
+        return render_ticket_page(
+            all_tickets=all_tickets,
+            active_page='tickets'
+        )
+
+    except Exception as e:
+        print("Error loading all tickets:", e)
+        return render_ticket_page(
+            manage_message="Error loading tickets.",
+            manage_error=True,
+            active_page='tickets'
+        )
+    finally:
+        if conn:
+            conn.close()
+
+
+
 if __name__ == '__main__':
     # NOTE: Set debug=False in production to prevent information disclosure
-    # Debug mode reveals sensitive error information and should only be used in development
+    # Debug mode reveals sensitive ecrror information and should only be used in development
     app.run(debug=True)  # Change to False for production deployment
+
