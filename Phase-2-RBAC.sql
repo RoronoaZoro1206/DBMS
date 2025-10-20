@@ -225,5 +225,5 @@ FROM information_schema.table_privileges
 WHERE grantee = 'admin_role'
 ORDER BY table_name, privilege_type;
 
-TRUNCATE TABLE public.audit_log_ticket RESTART IDENTITY CASCADE;
+TRUNCATE TABLE public.audit_log RESTART IDENTITY CASCADE;
 TRUNCATE TABLE public.tickets          RESTART IDENTITY CASCADE;
