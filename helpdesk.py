@@ -2107,10 +2107,7 @@ def tickets_full():
         if conn:
             conn.close()
 
-
-
 if __name__ == '__main__':
     # NOTE: Set debug=False in production to prevent information disclosure
     # Debug mode reveals sensitive ecrror information and should only be used in development
     app.run(debug=True)  # Change to False for production deployment
-
