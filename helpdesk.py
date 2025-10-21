@@ -767,19 +767,18 @@ html_template = """
                         <div class="space-y-3">
                             {% if results %}
                             {% for ticket in results %}
-                            <div class="grid grid-cols-1 md:grid-cols-5 gap-3 items-center rounded-xl border border-gray-200 bg-gray-50 p-4 text-sm">
-                            
-                            <div class="font-semibold text-gray-900 whitespace-nowrap">
+                            <div class="grid grid-cols-[auto_1fr_auto_auto] md:grid-cols-[100px_1fr_auto_auto] gap-3 items-center rounded-xl border border-gray-200 bg-gray-50 p-4 text-sm">
+
+                            <!-- Ticket ID -->
+                            <div class="font-semibold text-gray-900 whitespace-nowrap text-center md:text-left">
                                 Ticket #{{ ticket[0] }}
                             </div>
-
                             <div class="text-gray-700 break-words">
                                 {{ ticket[1] }}
                             </div>
-
-                            <div class="text-center">
+                            <div class="flex justify-center">
                                 {% if not show_resolved %}
-                                <form action="/resolve_ticket" method="post" class="inline">
+                                <form action="/resolve_ticket" method="post" class="inline-block">
                                 <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
                                 <input type="hidden" name="ticket_id" value="{{ ticket[0] }}">
                                 <button type="submit"
@@ -791,24 +790,24 @@ html_template = """
                                 <span class="text-xs text-gray-500 italic">Resolved</span>
                                 {% endif %}
                             </div>
-
-                            <div class="md:col-span-1">
+                            <div class="flex flex-wrap justify-center md:justify-end items-center gap-2">
+                                <!-- Update Form -->
                                 <form action="/tickets/edit" method="post" class="flex gap-2 items-center" autocomplete="off">
                                 <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
                                 <input type="hidden" name="ticket_id" value="{{ ticket[0] }}">
                                 <input type="hidden" name="source" value="{% if show_resolved %}resolved{% else %}active{% endif %}">
                                 <input type="text" name="issue" value="{{ ticket[1]|e }}"
-                                    class="flex-1 rounded-lg border border-gray-300 px-2 py-1 text-xs focus:ring-2 focus:ring-blue-500 focus:outline-none"
+                                    class="w-[150px] rounded-lg border border-gray-300 px-2 py-1 text-xs focus:ring-2 focus:ring-blue-500 focus:outline-none"
                                     autocomplete="off">
                                 <button type="submit"
                                     class="rounded-full bg-blue-500 px-3 py-1 text-xs font-semibold text-white hover:bg-blue-600 transition">
                                     Update
                                 </button>
                                 </form>
-                            </div>
 
-                            <div class="text-right">
-                                <form action="/tickets/delete" method="post" class="inline" onsubmit="return confirm('Delete this ticket?');">
+                                <!-- Delete Form -->
+                                <form action="/tickets/delete" method="post" class="inline-block"
+                                onsubmit="return confirm('Delete this ticket?');">
                                 <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
                                 <input type="hidden" name="ticket_id" value="{{ ticket[0] }}">
                                 <input type="hidden" name="source" value="{% if show_resolved %}resolved{% else %}active{% endif %}">
@@ -818,7 +817,9 @@ html_template = """
                                 </button>
                                 </form>
                             </div>
+
                             </div>
+
                             {% endfor %}
 
                             {% else %}
