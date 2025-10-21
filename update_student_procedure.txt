@@ -1,0 +1,91 @@
+CREATE OR REPLACE PROCEDURE update_student_data(
+    p_student_id INT,
+    p_new_name TEXT,
+    p_new_email TEXT,
+    p_new_phone TEXT,
+    p_admin_username TEXT
+)
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_role TEXT;
+    v_staff_id INT;
+    v_student_exists BOOLEAN;
+    v_email_conflict BOOLEAN;
+    v_old_name TEXT;
+    v_old_email TEXT;
+    v_old_phone TEXT;
+    v_old_data JSONB;
+    v_new_data JSONB;
+BEGIN
+    -- Get the role and staff_id of the admin user
+    SELECT role, id INTO v_role, v_staff_id 
+    FROM staff_users 
+    WHERE username = p_admin_username;
+
+    -- Check if user exists
+    IF v_role IS NULL THEN
+        RAISE EXCEPTION 'User "%" not found in staff_users.', p_admin_username;
+    END IF;
+
+    -- Check if user has admin role
+    IF v_role != 'admin_role' THEN
+        RAISE EXCEPTION 'Access denied: Only admin_role can update student data.';
+    END IF;
+
+    -- Check if student exists and retrieve old data
+    SELECT EXISTS(SELECT 1 FROM students WHERE id = p_student_id) INTO v_student_exists;
+    IF NOT v_student_exists THEN
+        RAISE EXCEPTION 'Student ID % does not exist.', p_student_id;
+    END IF;
+
+    -- Get old student data for audit log
+    SELECT name, email, phone 
+    INTO v_old_name, v_old_email, v_old_phone
+    FROM students 
+    WHERE id = p_student_id;
+
+    -- Check if new email conflicts with another student
+    SELECT EXISTS(
+        SELECT 1 
+        FROM students 
+        WHERE LOWER(email) = LOWER(p_new_email) 
+        AND id != p_student_id
+    ) INTO v_email_conflict;
+    
+    IF v_email_conflict THEN
+        RAISE EXCEPTION 'Email address "%" is already used by another student.', p_new_email;
+    END IF;
+
+    -- Build old_data JSON
+    v_old_data := jsonb_build_object(
+        'student_id', p_student_id,
+        'name', v_old_name,
+        'email', v_old_email,
+        'phone', v_old_phone
+    );
+
+    -- Build new_data JSON
+    v_new_data := jsonb_build_object(
+        'student_id', p_student_id,
+        'name', p_new_name,
+        'email', LOWER(p_new_email),
+        'phone', p_new_phone
+    );
+
+    -- Update student record
+    UPDATE students 
+    SET 
+        name = p_new_name,
+        email = LOWER(p_new_email),
+        phone = p_new_phone
+    WHERE id = p_student_id;
+
+    -- Log the update in audit_log
+    INSERT INTO audit_log (staff_id, action, old_data, new_data)
+    VALUES (v_staff_id, 'STUDENT_UPDATE', v_old_data, v_new_data);
+
+    -- Success message
+    RAISE NOTICE 'Student #% updated successfully by %.', p_student_id, p_admin_username;
+END;
+$$;

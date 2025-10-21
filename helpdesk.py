@@ -933,16 +933,18 @@ html_template = """
                                 <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
                                 <input type="number" name="student_id" placeholder="Student ID" required autocomplete="off"
                                     class="w-full rounded-lg border border-gray-300 px-3 py-2 focus:ring-2 focus:ring-amber-500 focus:outline-none">
-                                <input type="text" name="student_name" placeholder="Full Name" autocomplete="off"
+                                <input type="text" name="student_name" placeholder="Full Name" required autocomplete="off"
                                     class="w-full rounded-lg border border-gray-300 px-3 py-2 focus:ring-2 focus:ring-amber-500 focus:outline-none">
-                                <input type="email" name="student_email" placeholder="Email" autocomplete="off"
+                                <input type="email" name="student_email" placeholder="Email" required autocomplete="off"
                                     class="w-full rounded-lg border border-gray-300 px-3 py-2 focus:ring-2 focus:ring-amber-500 focus:outline-none">
-                                <input type="text" name="student_phone" placeholder="Phone"
+                                <input type="text" name="student_phone" placeholder="Phone (optional)" autocomplete="off"
                                     class="w-full rounded-lg border border-gray-300 px-3 py-2 focus:ring-2 focus:ring-amber-500 focus:outline-none">
                                 <button type="submit"
                                     class="w-full rounded-lg bg-amber-600 py-2 text-sm font-semibold text-white hover:bg-amber-700 transition">Update Student</button>
                             </form>
-                            <p class="text-xs text-gray-400 italic text-center">Backend handler: /students/edit (To be implemented)</p>
+                            {% if student_message %}
+                            <p class="text-xs font-medium text-center {% if student_error %}text-red-500{% else %}text-green-600{% endif %}">{{ student_message }}</p>
+                            {% endif %}
                         </section>
                         
                         <section class="rounded-2xl bg-white p-6 shadow">
@@ -1470,6 +1472,115 @@ def add_student():
         conn.rollback()
         print(f"Student insertion error: {error}")
         return render_student_feedback("An error occurred while adding the student.", True)
+    finally:
+        if conn:
+            conn.close()
+
+
+@app.route('/students/edit', methods=['POST'])
+@login_required
+def edit_student():
+    """Allow administrators to update student records with audit logging."""
+    if session.get('role') != 'admin_role':
+        return render_template_string(
+            html_template,
+            **base_view_context(
+                access_message="Access denied: admin only.",
+                active_page='sensitive'
+            )
+        )
+
+    def render_student_feedback(message, is_error=False):
+        return render_template_string(html_template, **sensitive_students_context(message, is_error))
+
+    student_id = request.form.get('student_id', '').strip()
+    name = request.form.get('student_name', '').strip()
+    email = request.form.get('student_email', '').strip()
+    phone = request.form.get('student_phone', '').strip()
+
+    if not student_id or not name or not email:
+        return render_student_feedback("Student ID, name, and email are required.", True)
+
+    try:
+        student_id = int(student_id)
+    except ValueError:
+        return render_student_feedback("Invalid student ID format.", True)
+
+    if len(name) > 150:
+        return render_student_feedback("Student name is too long (max 150 characters).", True)
+
+    email_pattern = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+    if len(email) > 254 or not email_pattern.match(email):
+        return render_student_feedback("Provide a valid student email address.", True)
+
+    sanitized_phone = re.sub(r"[^0-9+\-().\s]", "", phone)
+    sanitized_phone = re.sub(r"\s+", " ", sanitized_phone).strip()
+    if sanitized_phone and len(sanitized_phone) > 32:
+        return render_student_feedback("Phone number is too long (max 32 characters).", True)
+
+    conn = get_db_connection()
+    if not conn:
+        return render_student_feedback("Service temporarily unavailable.", True)
+
+    try:
+        cur = conn.cursor()
+
+        user_id = session.get('user_id')
+        set_trigger_user(cur, user_id)
+
+        # Check if student exists and get old data
+        cur.execute("SELECT id, name, email, phone FROM students WHERE id = %s", (student_id,))
+        old_record = cur.fetchone()
+        
+        if not old_record:
+            cur.close()
+            return render_student_feedback(f"Student ID #{student_id} does not exist.", True)
+
+        old_data = {
+            "student_id": old_record[0],
+            "name": old_record[1],
+            "email": old_record[2],
+            "phone": old_record[3]
+        }
+
+        # Check if email is taken by another student
+        cur.execute("SELECT id FROM students WHERE LOWER(email) = LOWER(%s) AND id != %s", (email, student_id))
+        existing = cur.fetchone()
+        if existing:
+            cur.close()
+            return render_student_feedback("Another student already uses that email address.", True)
+
+        # Update student record
+        cur.execute(
+            "UPDATE students SET name = %s, email = %s, phone = %s WHERE id = %s",
+            (name, email.lower(), sanitized_phone or None, student_id)
+        )
+
+        # Log the update action in audit_log
+        new_data = {
+            "student_id": student_id,
+            "name": name,
+            "email": email.lower(),
+            "phone": sanitized_phone or None
+        }
+        
+        staff_id = int(user_id) if user_id is not None else None
+        cur.execute(
+            "INSERT INTO audit_log (staff_id, action, old_data, new_data) VALUES (%s, %s, %s, %s)",
+            (staff_id, 'STUDENT_UPDATE', Json(old_data), Json(new_data))
+        )
+
+        conn.commit()
+        cur.close()
+        return render_student_feedback(f"Student #{student_id} updated successfully.")
+    except psycopg2.IntegrityError as error:
+        conn.rollback()
+        print(f"Student update integrity error: {error}")
+        return render_student_feedback("Unable to update student due to data constraints.", True)
+    except (Exception, psycopg2.Error) as error:
+        conn.rollback()
+        print(f"Student update error: {error}")
+        return render_student_feedback("An error occurred while updating the student.", True)
     finally:
         if conn:
             conn.close()

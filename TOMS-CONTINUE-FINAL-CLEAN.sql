@@ -151,24 +151,22 @@ EXECUTE FUNCTION log_ticket_changes();
 -- PART 5: RBAC Permissions for Audit Log
 -- ============================================================================
 
-REVOKE ALL ON audit_log FROM PUBLIC;
-REVOKE ALL ON audit_log FROM admin_role;
-REVOKE ALL ON audit_log FROM support_role;
+REVOKE ALL ON TABLE public.audit_log FROM PUBLIC;
+REVOKE ALL ON TABLE public.audit_log FROM admin_role;
+REVOKE ALL ON TABLE public.audit_log FROM support_role;
 
--- Only allow INSERT (so triggers can write logs)
--- This makes the audit_log immutable (cannot update/delete)
-GRANT INSERT ON audit_log TO admin_role;
-GRANT INSERT ON audit_log TO support_role;
+-- Step 3: Grant full permissions to admin_role
+GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE public.audit_log TO admin_role;
+
+-- Step 4: Grant INSERT only to support_role  
+GRANT INSERT ON TABLE public.audit_log TO support_role;
 
 -- ============================================================================
 -- PART 6: RBAC Permissions for Tickets
 -- ============================================================================
 
--- Remove update privilege from all columns by default
-REVOKE UPDATE ON tickets FROM admin_role;
-
--- Then grant update only on allowed columns (prevents updating id and created_at)
-GRANT UPDATE (issue, student_id) ON tickets TO admin_role;
+-- Admin can update all columns in tickets table
+GRANT UPDATE ON TABLE public.tickets TO admin_role;
 
 -- ============================================================================
 -- PART 7: Helper Function (Get All Tickets)

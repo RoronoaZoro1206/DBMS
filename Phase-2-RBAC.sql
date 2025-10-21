@@ -83,8 +83,16 @@ GRANT SELECT ON v_students_support TO support_role;
 -- 7c. Staff Users: NO access (cannot view or manage accounts)
 REVOKE ALL ON public.staff_users FROM support_role;
 
--- 7d. Audit Log: NO access (admin only)
-REVOKE ALL ON public.audit_log FROM support_role;
+-- 7d. Audit Log: Explicit permissions for both roles
+REVOKE ALL ON TABLE public.audit_log FROM PUBLIC;
+REVOKE ALL ON TABLE public.audit_log FROM admin_role;
+REVOKE ALL ON TABLE public.audit_log FROM support_role;
+
+-- Grant full permissions to admin_role
+GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE public.audit_log TO admin_role;
+
+-- Grant INSERT only to support_role (for triggers)
+GRANT INSERT ON TABLE public.audit_log TO support_role;
 
 -- 8. Future-proofing: default privileges
 --    Prevent accidental leakage to PUBLIC; explicitly grant admin control.
