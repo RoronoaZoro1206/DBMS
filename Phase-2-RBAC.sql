@@ -59,10 +59,6 @@ COMMENT ON ROLE admin_role IS
 
 
 -- 7. SUPPORT_ROLE PERMISSIONS (Limited Ticket Creation Only)
---    ✓ CAN: Create tickets, view student directory (no phone)
---    ✗ CANNOT: Search tickets, view tickets, update, delete, resolve
---    ✗ CANNOT: View full student data (phone), add students
---    ✗ CANNOT: Manage staff accounts, view audit logs
 
 -- 7a. Tickets: INSERT only (cannot SELECT, UPDATE, DELETE)
 REVOKE ALL ON public.tickets FROM support_role;
