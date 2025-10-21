@@ -768,14 +768,17 @@ html_template = """
                             {% if results %}
                             {% for ticket in results %}
                             <div class="grid grid-cols-[auto_1fr_auto_auto] md:grid-cols-[100px_1fr_auto_auto] gap-3 items-center rounded-xl border border-gray-200 bg-gray-50 p-4 text-sm">
-
                             <!-- Ticket ID -->
                             <div class="font-semibold text-gray-900 whitespace-nowrap text-center md:text-left">
                                 Ticket #{{ ticket[0] }}
                             </div>
+
+                            <!-- Issue Description -->
                             <div class="text-gray-700 break-words">
                                 {{ ticket[1] }}
                             </div>
+
+                            <!-- Resolve Column -->
                             <div class="flex justify-center">
                                 {% if not show_resolved %}
                                 <form action="/resolve_ticket" method="post" class="inline-block">
@@ -790,6 +793,8 @@ html_template = """
                                 <span class="text-xs text-gray-500 italic">Resolved</span>
                                 {% endif %}
                             </div>
+
+                            <!-- Update + Delete Column -->
                             <div class="flex flex-wrap justify-center md:justify-end items-center gap-2">
                                 <!-- Update Form -->
                                 <form action="/tickets/edit" method="post" class="flex gap-2 items-center" autocomplete="off">
