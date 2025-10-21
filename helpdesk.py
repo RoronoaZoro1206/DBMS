@@ -68,7 +68,7 @@ def get_db_connection():
             port=os.getenv("DB_PORT"),
             database=os.getenv("DB_NAME"),
             user=os.getenv("DB_USER"),
-            password=os.getenv("DB_PASS") or os.getenv("DB_PASSWORD"),
+            password=os.getenv("DB_PASSWORD"),
             # sslmode="disable"
         )
         return conn
@@ -1900,44 +1900,8 @@ def edit_ticket():
         else:
             student_id, old_issue = row
             set_trigger_user(cur, session.get('user_id'))
+            # Update ticket - database trigger will automatically create audit log entry
             cur.execute("UPDATE tickets SET issue = %s WHERE id = %s", (updated_issue, ticket_id))
-
-            staff_id = session.get('user_id')
-            staff_value = int(staff_id) if staff_id is not None else None
-            old_data = {
-                "ticket_id": ticket_id,
-                "student_id": student_id,
-                "issue": old_issue
-            }
-            new_data = {
-                "ticket_id": ticket_id,
-                "student_id": student_id,
-                "issue": updated_issue
-            }
-            ticket_id_text = str(ticket_id)
-            cur.execute(
-                """
-                UPDATE audit_log
-                   SET action = %s,
-                       staff_id = COALESCE(%s, staff_id),
-                       old_data = %s,
-                       new_data = %s
-                 WHERE audit_id = (
-                        SELECT audit_id FROM audit_log
-                         WHERE action = 'UPDATE'
-                           AND COALESCE(new_data->>'ticket_id', old_data->>'ticket_id') = %s
-                         ORDER BY logged_at DESC
-                         LIMIT 1
-                    )
-                """,
-                ('TICKET_EDIT', staff_value, Json(old_data), Json(new_data), ticket_id_text)
-            )
-            if cur.rowcount == 0:
-                cur.execute(
-                    "INSERT INTO audit_log (staff_id, action, old_data, new_data) VALUES (%s, %s, %s, %s)",
-                    (staff_value, 'TICKET_EDIT', Json(old_data), Json(new_data))
-                )
-
             conn.commit()
     except (Exception, psycopg2.Error) as error:
         print(f"Ticket update error: {error}")
@@ -2001,39 +1965,8 @@ def delete_ticket():
         else:
             student_id, old_issue = row
             set_trigger_user(cur, session.get('user_id'))
+            # Delete ticket - database trigger will automatically create audit log entry
             cur.execute("DELETE FROM tickets WHERE id = %s", (ticket_id,))
-
-            staff_id = session.get('user_id')
-            staff_value = int(staff_id) if staff_id is not None else None
-            old_data = {
-                "ticket_id": ticket_id,
-                "student_id": student_id,
-                "issue": old_issue
-            }
-            ticket_id_text = str(ticket_id)
-            cur.execute(
-                """
-                UPDATE audit_log
-                   SET action = %s,
-                       staff_id = COALESCE(%s, staff_id),
-                       old_data = %s,
-                       new_data = NULL
-                 WHERE audit_id = (
-                        SELECT audit_id FROM audit_log
-                         WHERE action = 'DELETE'
-                           AND COALESCE(new_data->>'ticket_id', old_data->>'ticket_id') = %s
-                         ORDER BY logged_at DESC
-                         LIMIT 1
-                    )
-                """,
-                ('TICKET_DELETE', staff_value, Json(old_data), ticket_id_text)
-            )
-            if cur.rowcount == 0:
-                cur.execute(
-                    "INSERT INTO audit_log (staff_id, action, old_data, new_data) VALUES (%s, %s, %s, %s)",
-                    (staff_value, 'TICKET_DELETE', Json(old_data), None)
-                )
-
             conn.commit()
     except (Exception, psycopg2.Error) as error:
         print(f"Ticket delete error: {error}")
