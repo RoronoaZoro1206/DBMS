@@ -127,8 +127,10 @@ def base_view_context(**overrides):
         'show_resolved': False,
         'login_message': None,
         'ticket_message': None,
-        'student_message': None,
-        'student_error': False,
+        'add_student_message': None,
+        'add_student_error': False,
+        'edit_student_message': None,
+        'edit_student_error': False,
         'account_message': None,
         'account_error': False,
         'search_message': None,
@@ -404,14 +406,16 @@ def render_ticket_page(**overrides):
     return render_template_string(html_template, **ticket_view_context(**overrides))
 
 
-def sensitive_students_context(message=None, is_error=False):
+def sensitive_students_context(add_message=None, add_error=False, edit_message=None, edit_error=False):
     return base_view_context(
         active_page='sensitive',
         page_title='Sensitive Records',
         page_description='Admin-only student contact information.',
         full_student_rows=load_full_students(),
-        student_message=message,
-        student_error=is_error
+        add_student_message=add_message,
+        add_student_error=add_error,
+        edit_student_message=edit_message,
+        edit_student_error=edit_error
     )
 
 
@@ -926,8 +930,8 @@ html_template = """
                                 <button type="submit"
                                     class="w-full rounded-lg bg-indigo-600 py-2 text-sm font-semibold text-white hover:bg-indigo-700 transition">Save Student</button>
                             </form>
-                            {% if student_message %}
-                            <p class="text-xs font-medium text-center {% if student_error %}text-red-500{% else %}text-green-600{% endif %}">{{ student_message }}</p>
+                            {% if add_student_message %}
+                            <p class="text-xs font-medium text-center {% if add_student_error %}text-red-500{% else %}text-green-600{% endif %}">{{ add_student_message }}</p>
                             {% endif %}
                         </section>
                         
@@ -947,8 +951,8 @@ html_template = """
                                 <button type="submit"
                                     class="w-full rounded-lg bg-amber-600 py-2 text-sm font-semibold text-white hover:bg-amber-700 transition">Update Student</button>
                             </form>
-                            {% if student_message %}
-                            <p class="text-xs font-medium text-center {% if student_error %}text-red-500{% else %}text-green-600{% endif %}">{{ student_message }}</p>
+                            {% if edit_student_message %}
+                            <p class="text-xs font-medium text-center {% if edit_student_error %}text-red-500{% else %}text-green-600{% endif %}">{{ edit_student_message }}</p>
                             {% endif %}
                         </section>
                         
@@ -1411,7 +1415,7 @@ def add_student():
         )
 
     def render_student_feedback(message, is_error=False):
-        return render_template_string(html_template, **sensitive_students_context(message, is_error))
+        return render_template_string(html_template, **sensitive_students_context(add_message=message, add_error=is_error))
 
     name = request.form.get('student_name', '').strip()
     email = request.form.get('student_email', '').strip()
@@ -1496,7 +1500,7 @@ def edit_student():
         )
 
     def render_student_feedback(message, is_error=False):
-        return render_template_string(html_template, **sensitive_students_context(message, is_error))
+        return render_template_string(html_template, **sensitive_students_context(edit_message=message, edit_error=is_error))
 
     student_id = request.form.get('student_id', '').strip()
     name = request.form.get('student_name', '').strip()
